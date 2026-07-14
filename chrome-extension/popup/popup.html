@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Outlook Token Fetcher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div class="header-left">
+        <div class="logo-icon">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+            <polyline points="22,6 12,13 2,6"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="title">Outlook Token Fetcher</h1>
+          <span class="subtitle">半自动获取刷新令牌</span>
+        </div>
+      </div>
+      <button id="settingsBtn" class="icon-btn" title="设置">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Account Input -->
+    <div class="card">
+      <label class="input-label">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+        待处理账号（邮箱----密码）
+        <span class="count-badge" id="accountCount">0</span>
+      </label>
+      <textarea id="accountInput" class="textarea" placeholder="user1@outlook.com----password123&#10;user2@outlook.com----password456" rows="4" spellcheck="false"></textarea>
+    </div>
+
+    <!-- Mode Selector -->
+    <div class="card mode-card">
+      <div class="mode-selector">
+        <span class="mode-label">执行模式</span>
+        <div class="mode-options">
+          <button id="modeAuto" class="mode-btn mode-active" data-mode="auto">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            自动
+          </button>
+          <button id="modeManual" class="mode-btn" data-mode="step-by-step">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+            逐步骤
+          </button>
+        </div>
+        <span class="mode-hint" id="modeHint">自动模式：步骤 1-4 全自动（含换取令牌）；备用邮箱验证成功后会重开授权页</span>
+      </div>
+    </div>
+
+    <!-- 4-Step Progress -->
+    <div class="step-progress">
+      <div class="step-item" id="step1">
+        <div class="step-circle pending">1</div>
+        <span class="step-label">打开授权页</span>
+      </div>
+      <div class="step-connector" id="conn1"></div>
+      <div class="step-item" id="step2">
+        <div class="step-circle pending">2</div>
+        <span class="step-label">登录账号</span>
+      </div>
+      <div class="step-connector" id="conn2"></div>
+      <div class="step-item" id="step3">
+        <div class="step-circle pending">3</div>
+        <span class="step-label">安全验证</span>
+      </div>
+      <div class="step-connector" id="conn3"></div>
+      <div class="step-item" id="step4">
+        <div class="step-circle pending">4</div>
+        <span class="step-label">获取令牌</span>
+      </div>
+    </div>
+
+    <!-- Current Account Display -->
+    <div class="current-account" id="currentAccountDisplay">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      <span id="currentAccountText">等待开始...</span>
+      <span class="account-progress" id="progressText"></span>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="action-row">
+      <button id="startBtn" class="btn btn-primary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        开始处理
+      </button>
+      <button id="pauseBtn" class="btn btn-warning" disabled title="暂停后可点继续">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+        暂停
+      </button>
+      <button id="resumeBtn" class="btn btn-resume" disabled title="从暂停处继续当前账号/队列">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        继续
+      </button>
+      <button id="stopBtn" class="btn btn-danger" disabled title="完全停止并清空队列">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+        停止
+      </button>
+      <button id="skipBtn" class="btn btn-secondary" disabled>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
+        跳过
+      </button>
+    </div>
+
+    <!-- Log -->
+    <div class="card">
+      <div class="section-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        <span>执行日志</span>
+        <button id="clearLogBtn" class="small-btn">清空</button>
+      </div>
+      <div class="log-container" id="logContainer">
+        <div class="log-line info">
+          <span class="log-time">--:--:--</span>
+          <span class="log-msg">就绪，等待操作...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Results -->
+    <div class="card">
+      <div class="section-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <span>处理结果</span>
+        <span class="result-badge" id="resultCount">0</span>
+        <div class="section-actions">
+          <button id="copyResultsBtn" class="small-btn">复制</button>
+          <button id="exportResultsBtn" class="small-btn">导出</button>
+        </div>
+      </div>
+      <textarea id="resultsOutput" class="textarea result-area" readonly placeholder="已获取的 token 将在此显示..." rows="3"></textarea>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

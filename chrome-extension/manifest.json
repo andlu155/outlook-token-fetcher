@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Outlook Token Fetcher",
+  "version": "1.9",
+  "description": "半自动获取 Outlook 账号 OAuth2 刷新令牌 — 多固定备用邮箱轮流；自动/逐步骤；暂停继续",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "declarativeNetRequest",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "*://login.microsoftonline.com/*",
+    "*://login.live.com/*",
+    "*://account.live.com/*",
+    "*://*.microsoft.com/*",
+    "*://*.live.com/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_title": "Outlook Token Fetcher"
+  },
+  "side_panel": {
+    "default_path": "popup/popup.html"
+  },
+  "options_page": "options/options.html",
+  "incognito": "split",
+  "background": {
+    "service_worker": "background/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://login.microsoftonline.com/*",
+        "*://login.live.com/*",
+        "*://account.live.com/*",
+        "*://*.microsoft.com/*",
+        "*://*.live.com/*"
+      ],
+      "js": ["content/content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

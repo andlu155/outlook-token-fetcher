@@ -1,0 +1,23 @@
+{
+  "name": "outlook-token-fetcher",
+  "version": "1.9.0",
+  "description": "Chrome extension for semi-automatic Outlook / Microsoft OAuth2 refresh token fetching",
+  "private": true,
+  "scripts": {
+    "check": "node --check chrome-extension/background/background.js && node --check chrome-extension/content/content.js && node --check chrome-extension/popup/popup.js && node --check chrome-extension/options/options.js",
+    "pack": "node scripts/pack.js"
+  },
+  "keywords": [
+    "chrome-extension",
+    "outlook",
+    "oauth2",
+    "microsoft",
+    "refresh-token",
+    "pkce"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PLACEHOLDER/outlook-token-fetcher.git"
+  }
+}

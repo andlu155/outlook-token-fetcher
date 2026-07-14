@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>设置 — Outlook Token Fetcher</title>
+  <style>
+    :root {
+      --bg: #0a0e27; --bg-card: rgba(255,255,255,0.04);
+      --border: rgba(255,255,255,0.08); --accent: #00d4ff;
+      --accent-dim: rgba(0,212,255,0.15); --success: #10b981;
+      --danger: #ef4444; --text: #e2e8f0; --text2: #94a3b8;
+      --text3: #64748b; --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --radius: 12px; --radius-sm: 8px;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: var(--font); background: var(--bg); color: var(--text);
+      min-height: 100vh; display: flex; justify-content: center;
+      -webkit-font-smoothing: antialiased;
+    }
+    .container {
+      max-width: 540px; width: 100%; padding: 32px 20px;
+    }
+    h2 {
+      font-size: 20px; font-weight: 800; letter-spacing: -0.5px;
+      margin-bottom: 24px; display: flex; align-items: center; gap: 10px;
+    }
+    h2 span { background: linear-gradient(135deg, var(--accent), #7c3aed); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .card {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 20px; margin-bottom: 16px;
+      backdrop-filter: blur(12px);
+    }
+    .card-title {
+      font-size: 13px; font-weight: 700; margin-bottom: 14px; color: var(--text);
+      padding-bottom: 8px; border-bottom: 1px solid var(--border);
+    }
+    .form-group { margin-bottom: 14px; }
+    .form-group:last-child { margin-bottom: 0; }
+    label {
+      display: block; font-size: 12px; font-weight: 600; color: var(--text2);
+      margin-bottom: 6px;
+    }
+    label.check-label { display: inline; font-weight: 400; font-size: 13px; color: var(--text); margin-left: 6px; }
+    input[type="text"], input[type="password"], input[type="email"], textarea {
+      width: 100%; padding: 8px 12px;
+      background: rgba(0,0,0,0.3); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); color: var(--text);
+      font-family: var(--font); font-size: 13px; outline: none;
+      transition: border-color 0.2s;
+      resize: vertical;
+    }
+    input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
+    input::placeholder, textarea::placeholder { color: var(--text3); }
+    .hint { font-size: 11px; color: var(--text3); margin-top: 4px; }
+    .inline-group {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    }
+    .inline-group input { flex: 1; min-width: 120px; }
+    .btn {
+      padding: 7px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+      background: rgba(255,255,255,0.06); color: var(--text2);
+      font-family: var(--font); font-size: 12px; cursor: pointer;
+      transition: all 0.2s; white-space: nowrap;
+    }
+    .btn:hover { background: rgba(255,255,255,0.1); color: var(--text); }
+    .btn-primary {
+      display: block; width: 100%; padding: 10px;
+      background: linear-gradient(135deg, var(--accent), #7c3aed);
+      color: #fff; border: none; font-size: 14px; font-weight: 700;
+      box-shadow: 0 2px 12px rgba(0,212,255,0.2);
+    }
+    .btn-primary:hover { box-shadow: 0 4px 20px rgba(0,212,255,0.35); color: #fff; }
+    #status { text-align: center; margin-top: 10px; font-size: 13px; font-weight: 600; height: 20px; color: var(--success); }
+    .radio-group { display: flex; gap: 16px; margin: 6px 0; }
+    .radio-group label { display: inline; font-weight: 400; font-size: 13px; color: var(--text); }
+    input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+    input[type="radio"] { accent-color: var(--accent); cursor: pointer; }
+    #apiTestResult { font-size: 12px; margin-top: 6px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2><span>Outlook Token Fetcher</span> 设置</h2>
+
+    <div class="card">
+      <div class="card-title">📧 备用安全信息</div>
+      <div class="form-group">
+        <label>备用邮箱模式</label>
+        <div class="radio-group">
+          <label><input type="radio" name="backupEmailMode" id="backupModeFixed" value="fixed" checked> 固定邮箱</label>
+          <label><input type="radio" name="backupEmailMode" id="backupModeRandom" value="random"> 随机邮箱</label>
+        </div>
+      </div>
+      <div class="form-group" id="fixedEmailGroup">
+        <label>固定备用邮箱（最多 10 个，执行时按顺序轮流使用）</label>
+        <textarea id="backupEmailList" rows="5" placeholder="每行一个邮箱，最多 10 个&#10;01jing@ldymail.cc.cd&#10;02jing@ldymail.cc.cd&#10;03jing@ldymail.cc.cd" spellcheck="false"></textarea>
+        <div class="hint" id="fixedEmailCountHint">已填写 0 / 10 个。处理账号时按列表顺序循环选用。</div>
+        <!-- 兼容旧字段：保存时同步第一项到 backupEmail -->
+        <input type="hidden" id="backupEmail" value="">
+      </div>
+      <div class="form-group" id="randomEmailGroup" style="display:none;">
+        <label>邮箱域名</label>
+        <input type="text" id="backupEmailDomain" placeholder="ldymail.cc.cd">
+        <div class="hint">随机模式下，每个账号会生成类似 <code>abc123@域名</code> 的备用邮箱。</div>
+        <div class="hint" id="randomEmailPreview" style="margin-top:6px;color:var(--accent);"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">☁️ 自动接码服务</div>
+      <div class="form-group">
+        <input type="checkbox" id="tempEmailEnabled">
+        <label class="check-label" for="tempEmailEnabled">启用自动接码</label>
+      </div>
+      <div class="form-group">
+        <label>API 地址</label>
+        <input type="text" id="tempEmailApiUrl" placeholder="https://your-worker.workers.dev">
+      </div>
+      <div class="form-group">
+        <label>Admin 密码</label>
+        <div class="inline-group">
+          <input type="password" id="tempEmailAdminPassword" placeholder="Admin Password">
+          <button id="togglePasswordBtn" class="btn">👁️ 显示</button>
+          <button id="testApiBtn" class="btn" style="border-color:var(--accent);color:var(--accent);">🔌 测试连接</button>
+        </div>
+        <div id="apiTestResult"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🔑 Client ID 配置</div>
+      <div class="form-group">
+        <div class="radio-group">
+          <label><input type="radio" name="clientIdMode" id="modeRandom" value="random" checked> 随机内置 ID</label>
+          <label><input type="radio" name="clientIdMode" id="modeCustom" value="custom"> 自定义 ID</label>
+        </div>
+        <div id="customIdContainer" style="display:none; margin-top: 10px;">
+          <input type="text" id="customClientId" placeholder="输入自定义 Client ID">
+        </div>
+      </div>
+    </div>
+
+    <button id="saveBtn" class="btn btn-primary">保存设置</button>
+    <div id="status"></div>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>

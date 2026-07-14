@@ -1,0 +1,44 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Claude / local tooling
+.claude/
+.cursor/
+
+# Dependencies / build
+node_modules/
+npm-debug.log*
+yarn-error.log*
+dist/
+build/
+*.zip
+*.crx
+*.pem
+
+# Secrets & local env
+.env
+.env.*
+!.env.example
+*.local
+secrets/
+
+# Local scratch / one-off fix scripts (not part of the extension)
+/debug.js
+/fix_*.js
+/test*.js
+/rewrite.js
+/update_check.js
+
+# Logs & temp
+*.log
+tmp/
+temp/
+.cache/
