@@ -436,30 +436,8 @@ async function executeStep4() {
     try {
       const tokenRes = await exchangeToken(snap.code, snap.clientId, verifier);
       
-      // 验证令牌可用性
-      let tokenValid = true;
-      if (tokenRes.access_token) {
-        sendLog(`[${snap.email}] 获取令牌成功，正在验证令牌可用性...`, 'info');
-        try {
-          const verifyRes = await fetch('https://outlook.office.com/api/v2.0/me', {
-            method: 'GET',
-            headers: { 'Authorization': `Bearer ${tokenRes.access_token}` }
-          });
-          
-          if (verifyRes.status === 401 || verifyRes.status === 403) {
-            tokenValid = false;
-            const errTxt = await verifyRes.text().catch(() => '');
-            throw new Error(`令牌无法访问 Outlook API (HTTP ${verifyRes.status}): ${errTxt.substring(0, 100)}`);
-          } else {
-            sendLog(`[${snap.email}] ✅ 令牌验证通过（可正常访问 API）`, 'success');
-          }
-        } catch (e) {
-          if (!tokenValid) throw e;
-          sendLog(`[${snap.email}] ⚠️ 验证请求网络异常，但令牌已获取: ${e.message}`, 'warning');
-        }
-      } else {
-        sendLog(`[${snap.email}] ⚠️ 微软未返回 access_token，跳过验证`, 'warning');
-      }
+      // 注：不再使用 HTTP 请求验证 IMAP 令牌，因为会导致 401 误杀。
+      // 只要成功拿到 refresh_token 即认为成功。
 
       broadcastStep(4, 'completed', snap.email);
       await finishAccount({
