@@ -55,13 +55,18 @@ document.addEventListener('DOMContentLoaded', () => {
     if (r.savedAccounts) els.accountInput.value = r.savedAccounts;
     if (r.execMode) setMode(r.execMode);
     updateCount();
+    
+    // 强制清理残留状态：如果后台脚本并没有真的在运行（或者重启了浏览器），不能仅仅因为 sw_current 残留就变为 paused
+    // 我们必须信任 sw_running 或 sw_paused，如果两者都不为 true，强制进入 idle
     if (r.sw_running) {
       setUiState('running');
-    } else if (r.sw_paused || r.sw_current || (r.sw_queue && r.sw_queue.length)) {
+    } else if (r.sw_paused) {
       setUiState('paused');
       if (r.sw_current?.email) els.currentAccountText.textContent = r.sw_current.email + '（已暂停）';
     } else {
       setUiState('idle');
+      // 可以顺手清理一下残留队列
+      chrome.storage.local.remove(['sw_current', 'sw_queue']);
     }
   });
 
