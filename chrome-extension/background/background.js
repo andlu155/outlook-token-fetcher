@@ -254,8 +254,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               const res2 = await chrome.storage.local.get('sw_settings');
               list = parseFixedBackupList(res2.sw_settings || {});
             }
-            const prefix = maskLocal.replace(/*/g, '').replace(/s+/g, '').toLowerCase();
-            const pureDomain = maskDomain.replace(/s+/g, '').toLowerCase();
+            const prefix = maskLocal.replace(/\*/g, '').replace(/\s+/g, '').toLowerCase();
+            const pureDomain = maskDomain.replace(/\s+/g, '').toLowerCase();
             sendLog(`[匹配调试] 当前池 ${list.length} 个，寻找前缀 '${prefix}', 域名 '${maskDomain}'`, 'info');
             for (let e of list) {
                 const [l, d] = e.split('@');
