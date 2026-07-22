@@ -15,7 +15,13 @@ const claimedAuthCodes = new Set();
 // Round-robin index for multi fixed backup emails (persisted across accounts in a batch).
 let backupEmailCursor = 0;
 
-const SCOPES = 'offline_access https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send';
+function getScopes() {
+  // 如果用户在设置里选择了 Graph 模式，就只申请 Graph 权限；否则默认申请 IMAP 权限
+  if (settings.apiMode === 'graph') {
+    return 'offline_access https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send';
+  }
+  return 'offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send';
+}
 const REDIRECT_URI = 'https://login.microsoftonline.com/common/oauth2/nativeclient';
 const AUTH_ENDPOINT = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize';
 const TOKEN_ENDPOINT = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
@@ -111,7 +117,7 @@ function describeFixedBackupPick(settingsObj, picked) {
 function buildAuthUrl(clientId, codeChallenge, state) {
   const p = new URLSearchParams({
     client_id: clientId, response_type: 'code', redirect_uri: REDIRECT_URI,
-    scope: SCOPES, code_challenge: codeChallenge, code_challenge_method: 'S256',
+    scope: getScopes(), code_challenge: codeChallenge, code_challenge_method: 'S256',
     state: state, prompt: 'login'
   });
   return `${AUTH_ENDPOINT}?${p.toString()}`;
@@ -730,7 +736,7 @@ async function stopProcess() {
 // ============== Token Exchange ==============
 async function exchangeToken(authCode, clientId, codeVerifier) {
   const body = new URLSearchParams({
-    client_id: clientId, scope: SCOPES, code: authCode,
+    client_id: clientId, scope: getScopes(), code: authCode,
     redirect_uri: REDIRECT_URI, grant_type: 'authorization_code', code_verifier: codeVerifier
   });
   const res = await fetch(TOKEN_ENDPOINT, {
