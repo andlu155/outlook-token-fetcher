@@ -15,7 +15,7 @@ const claimedAuthCodes = new Set();
 // Round-robin index for multi fixed backup emails (persisted across accounts in a batch).
 let backupEmailCursor = 0;
 
-const SCOPES = 'offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send';
+const SCOPES = 'offline_access https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send';
 const REDIRECT_URI = 'https://login.microsoftonline.com/common/oauth2/nativeclient';
 const AUTH_ENDPOINT = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize';
 const TOKEN_ENDPOINT = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
