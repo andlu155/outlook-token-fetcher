@@ -6,7 +6,8 @@ document.addEventListener('DOMContentLoaded', () => {
     'tempEmailEnabled',
     'tempEmailApiUrl',
     'tempEmailAdminPassword',
-    'customClientId'
+    'customClientId',
+    'apiMode'
   ];
 
   function parseFixedList(text) {
