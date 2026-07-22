@@ -245,9 +245,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const [maskLocal, maskDomain] = masked.split('@');
         let matched = null;
         if (maskLocal && maskDomain) {
-            const list = parseFixedBackupList(settings);
+            let list = parseFixedBackupList(settings);
+            if (!list || list.length === 0) { list = parseFixedBackupList(await chrome.storage.local.get('backupEmailList')); }
+            if (!list || list.length === 0) { list = parseFixedBackupList(await chrome.storage.local.get('sw_settings').then(r => r.sw_settings || {})); }
             const regexStr = '^' + maskLocal.replace(/\*/g, '.*') + '$';
             const regex = new RegExp(regexStr, 'i');
+            sendLog(`[匹配调试] 当前池中共有 ${list.length} 个邮箱`, 'info');
             for (let e of list) {
                 const [l, d] = e.split('@');
                 if (d && d.toLowerCase() === maskDomain.toLowerCase() && regex.test(l)) {
