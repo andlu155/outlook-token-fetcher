@@ -16,6 +16,40 @@ const claimedAuthCodes = new Set();
 let backupEmailCursor = 0;
 // When true, in-memory queue/current is ahead of storage — skip loadState until saveState lands.
 let stateDirty = false;
+// Finished accounts since last Microsoft session cleanup (normal/incognito each have own SW).
+let accountsSinceCleanup = 0;
+const CLEANUP_EVERY_N = 5;
+
+// Origins / cookie domains used by Microsoft login & Outlook (clear only these).
+const MS_BROWSING_ORIGINS = [
+  'https://login.microsoftonline.com',
+  'https://login.live.com',
+  'https://account.live.com',
+  'https://account.microsoft.com',
+  'https://signup.live.com',
+  'https://outlook.live.com',
+  'https://outlook.office.com',
+  'https://outlook.office365.com',
+  'https://www.office.com',
+  'https://www.microsoft.com',
+  'https://microsoft.com',
+  'https://www.live.com',
+  'https://live.com',
+];
+const MS_COOKIE_DOMAIN_SUFFIXES = [
+  'login.microsoftonline.com',
+  'microsoftonline.com',
+  'login.live.com',
+  'account.live.com',
+  'account.microsoft.com',
+  'live.com',
+  'microsoft.com',
+  'office.com',
+  'office365.com',
+  'outlook.live.com',
+  'outlook.office.com',
+  'msn.com',
+];
 
 function getScopes() {
   // 默认 Graph；仅当显式选择 imap 时走 IMAP/SMTP
@@ -478,7 +512,7 @@ async function executeStep4() {
       sendLog(`[${snap.email}] 已有成功令牌，跳过重复换取`, 'info');
       currentAccount = null;
       await saveState();
-      setTimeout(() => processNext(), 500);
+      scheduleAdvance(500);
       return;
     }
 
@@ -535,7 +569,7 @@ async function executeStep4() {
       if (results.some((r) => r.success && r.email === snap.email && r.token)) {
         sendLog(`[${snap.email}] 忽略过期授权码错误（令牌已成功获取）`, 'info');
         if (!currentAccount && !isPaused && isRunning) {
-          setTimeout(() => processNext(), 500);
+          scheduleAdvance(500);
         }
         return;
       }
@@ -580,6 +614,7 @@ async function startProcess(accounts) {
   currentAccount = null;
   claimedAuthCodes.clear();
   backupEmailCursor = 0;
+  accountsSinceCleanup = 0;
   markDirty();
   if (currentTabId) { chrome.tabs.remove(currentTabId).catch(() => {}); currentTabId = null; }
 
@@ -772,6 +807,97 @@ async function processNext() {
   }, 3000);
 }
 
+// ============== Microsoft / Outlook session cleanup ==============
+function profileLabel() {
+  try {
+    return chrome.extension?.inIncognitoContext ? '无痕模式' : '普通模式';
+  } catch (_) {
+    return '当前配置';
+  }
+}
+
+function isMsCookieDomain(domain) {
+  const d = String(domain || '').replace(/^\./, '').toLowerCase();
+  if (!d) return false;
+  return MS_COOKIE_DOMAIN_SUFFIXES.some((s) => d === s || d.endsWith('.' + s));
+}
+
+async function clearOutlookSessionCache(reason = '') {
+  const label = profileLabel();
+  sendLog(`🧹 [${label}] 清理 Outlook/Microsoft 登录缓存${reason ? `（${reason}）` : ''}...`, 'warning');
+
+  // Close auth tab first so the page cannot rewrite cookies during clear.
+  if (currentTabId) {
+    const tabToClose = currentTabId;
+    currentTabId = null;
+    try { await chrome.tabs.remove(tabToClose); } catch (_) {}
+  }
+
+  let cookieCount = 0;
+  try {
+    const all = await chrome.cookies.getAll({});
+    const targets = all.filter((c) => isMsCookieDomain(c.domain));
+    await Promise.all(targets.map((c) => {
+      const protocol = c.secure ? 'https:' : 'http:';
+      const host = (c.domain || '').startsWith('.') ? c.domain.slice(1) : c.domain;
+      const url = `${protocol}//${host}${c.path || '/'}`;
+      const opts = { url, name: c.name };
+      if (c.storeId) opts.storeId = c.storeId;
+      return chrome.cookies.remove(opts).catch(() => null);
+    }));
+    cookieCount = targets.length;
+  } catch (e) {
+    sendLog(`[${label}] Cookie 清理失败: ${e.message || e}`, 'warning');
+  }
+
+  try {
+    await chrome.browsingData.remove(
+      { origins: MS_BROWSING_ORIGINS },
+      {
+        cookies: true,
+        localStorage: true,
+        indexedDB: true,
+        cacheStorage: true,
+        serviceWorkers: true,
+        fileSystems: true,
+        pluginData: true,
+      }
+    );
+  } catch (e) {
+    sendLog(`[${label}] browsingData 清理失败: ${e.message || e}`, 'warning');
+  }
+
+  // Drop leftover PKCE blobs so next account always starts clean.
+  try {
+    const all = await chrome.storage.local.get(null);
+    const pkceKeys = Object.keys(all || {}).filter((k) => k.startsWith('pkce_'));
+    if (pkceKeys.length) await chrome.storage.local.remove(pkceKeys);
+  } catch (_) {}
+
+  accountsSinceCleanup = 0;
+  markDirty();
+  await saveState();
+  sendLog(`🧹 [${label}] 缓存清理完成（Cookie ${cookieCount} 条）`, 'success');
+}
+
+/** After finishing N accounts, clear MS session before opening the next auth page. */
+async function scheduleAdvance(delayMs = 1500) {
+  if (isPaused || !isRunning) return;
+  const needClean = accountsSinceCleanup >= CLEANUP_EVERY_N;
+  const wait = needClean ? Math.max(delayMs, 600) : delayMs;
+  setTimeout(async () => {
+    if (isPaused || !isRunning) return;
+    try {
+      if (accountsSinceCleanup >= CLEANUP_EVERY_N) {
+        await clearOutlookSessionCache(`已处理 ${accountsSinceCleanup} 个账号`);
+      }
+    } catch (e) {
+      sendLog(`缓存清理异常: ${e.message || e}`, 'warning');
+    }
+    if (!isPaused && isRunning) processNext();
+  }, wait);
+}
+
 // ============== Manual skip to next account ==============
 async function skipToNextAccount(reason = '用户手动切换到下一个账号') {
   // Prefer in-memory state; only fill gaps from storage if SW was just woken.
@@ -810,6 +936,7 @@ async function skipToNextAccount(reason = '用户手动切换到下一个账号'
       markDirty();
       broadcastToPopup({ type: 'accountResult', result: skipped });
       sendLog(`[${skipped.email}] ⏭ ${reason}`, 'warning');
+      accountsSinceCleanup += 1;
     } else {
       sendLog(`[${currentAccount.email}] ⏭ 已有成功结果，切换下一账号`, 'info');
     }
@@ -825,7 +952,7 @@ async function skipToNextAccount(reason = '用户手动切换到下一个账号'
   markDirty();
   await saveState();
   broadcastToPopup({ type: 'resumed', account: null, remaining: accountsQueue.length });
-  setTimeout(() => processNext(), 400);
+  scheduleAdvance(400);
 }
 
 // ============== Finish Current Account ==============
@@ -839,7 +966,7 @@ async function finishAccount(result) {
     // Already finished this exact outcome — still try to advance if queue remains.
     if (results.some((r) => r.email === result.email && r.token === result.token && r.success === result.success)) {
       if (!isPaused && isRunning && !currentAccount) {
-        setTimeout(() => processNext(), 500);
+        scheduleAdvance(500);
       }
       return;
     }
@@ -860,7 +987,7 @@ async function finishAccount(result) {
     if (existingSuccess) {
       sendLog(`[${result.email}] 忽略失败结果（已有成功令牌）: ${String(result.error || '').slice(0, 80)}`, 'info');
       await saveState();
-      if (!isPaused && isRunning) setTimeout(() => processNext(), 500);
+      if (!isPaused && isRunning) scheduleAdvance(500);
       return;
     }
   } else {
@@ -873,11 +1000,12 @@ async function finishAccount(result) {
   if (results.some((r) => `${r.email}|${r.success}|${r.token || r.error || ''}` === lineKey)) {
     // Duplicate finish must still advance the queue (was the main stuck-after-success bug).
     await saveState();
-    if (!isPaused && isRunning) setTimeout(() => processNext(), 500);
+    if (!isPaused && isRunning) scheduleAdvance(500);
     return;
   }
 
   results.push(result);
+  accountsSinceCleanup += 1;
   markDirty();
   await saveState();
 
@@ -892,7 +1020,7 @@ async function finishAccount(result) {
   if (isPaused) return;
   // Always advance after a terminal finish when still running.
   if (shouldAdvance || isRunning) {
-    setTimeout(() => processNext(), 1500);
+    scheduleAdvance(1500);
   }
 }
 

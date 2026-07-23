@@ -1,14 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Outlook Token Fetcher",
-  "version": "1.10",
-  "description": "半自动获取 Outlook 账号 OAuth2 刷新令牌 — 多固定备用邮箱轮流；自动/逐步骤；下一账号；暂停继续",
+  "version": "1.11",
+  "description": "半自动获取 Outlook 账号 OAuth2 刷新令牌 — 多固定备用邮箱轮流；自动/逐步骤；下一账号；每5账号清缓存",
   "permissions": [
     "storage",
     "tabs",
     "scripting",
     "declarativeNetRequest",
-    "sidePanel"
+    "sidePanel",
+    "browsingData",
+    "cookies"
   ],
   "host_permissions": [
     "*://login.microsoftonline.com/*",
