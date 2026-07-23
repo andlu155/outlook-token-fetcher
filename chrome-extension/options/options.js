@@ -38,6 +38,8 @@ document.addEventListener('DOMContentLoaded', () => {
       if (el) {
         if (el.type === 'checkbox') {
           el.checked = !!result[f];
+        } else if (f === 'apiMode') {
+          el.value = result[f] || 'graph';
         } else {
           el.value = result[f] || '';
         }

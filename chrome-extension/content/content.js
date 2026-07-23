@@ -569,20 +569,30 @@ function executeStep3() {
 
     // 检查页面上是否提示了掩码邮箱 (例如 "我们将向 05*****@ldymail.cc.cd 发送代码")
     const bodyText = pageText();
-    // 匹配类似：我们将向 05*****@ldymail.cc.cd 发送代码
-    const maskedMatch = bodyText.match(/我们将向s*([^s]+@[^s]+)s*发送代码/i) || bodyText.match(/向s*([^s]+@[^s]+)s*发送/i);
+    // 兼容中英文文案，并容忍掩码邮箱前后的空白/换行
+    const maskedMatch =
+      bodyText.match(/我们将向\s*([^\s@]+@[^\s@]+)\s*发送代码/i) ||
+      bodyText.match(/向\s*([^\s@]+@[^\s@]+)\s*发送(?:验证)?代码/i) ||
+      bodyText.match(/we(?:'|’)ll send (?:a )?code to\s*([^\s@]+@[^\s@]+)/i) ||
+      bodyText.match(/send (?:a )?code to\s*([^\s@]+@[^\s@]+)/i) ||
+      bodyText.match(/([0-9a-z*]{2,}\*{2,}[0-9a-z*]*@[^\s@]+)/i);
     if (maskedMatch) {
-      const maskedEmail = maskedMatch[1];
+      const maskedEmail = String(maskedMatch[1] || '').replace(/\s+/g, '');
       sendLog(`步骤 3/4：页面提示需验证已有邮箱 ${maskedEmail}，正在本地池中匹配...`, 'info');
       chrome.runtime.sendMessage({ action: 'matchMaskedEmail', maskedEmail }, (matchedEmail) => {
+        if (chrome.runtime.lastError) {
+          lastAction = '';
+          sendLog(`❌ 匹配请求失败: ${chrome.runtime.lastError.message}`, 'error');
+          return;
+        }
         if (!matchedEmail) {
           sendLog(`❌ 本地备用邮箱池中未找到与 ${maskedEmail} 匹配的邮箱，跳过该账号`, 'error');
           chrome.runtime.sendMessage({ action: 'skipAccount', reason: `找不到匹配的备用邮箱 ${maskedEmail}` });
           return;
         }
         sendLog(`✅ 成功匹配到已有备用邮箱 ${matchedEmail}`, 'success');
-        // 将当前正在执行的账号的备用邮箱更新为匹配到的，防止后续接码时用错
-        currentAccount.backupEmail = matchedEmail; 
+        // 同步本地与后台，保证后续接码使用匹配到的地址
+        if (currentAccount) currentAccount.backupEmail = matchedEmail;
         executeFill(matchedEmail);
       });
       return;

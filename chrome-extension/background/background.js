@@ -14,13 +14,16 @@ let step4Lock = false;
 const claimedAuthCodes = new Set();
 // Round-robin index for multi fixed backup emails (persisted across accounts in a batch).
 let backupEmailCursor = 0;
+// When true, in-memory queue/current is ahead of storage — skip loadState until saveState lands.
+let stateDirty = false;
 
 function getScopes() {
-  // 如果用户在设置里选择了 Graph 模式，就只申请 Graph 权限；否则默认申请 IMAP 权限
-  if (settings.apiMode === 'graph') {
-    return 'offline_access https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send';
+  // 默认 Graph；仅当显式选择 imap 时走 IMAP/SMTP
+  const mode = (settings.apiMode || 'graph').toLowerCase();
+  if (mode === 'imap') {
+    return 'offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send';
   }
-  return 'offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send';
+  return 'offline_access https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send';
 }
 const REDIRECT_URI = 'https://login.microsoftonline.com/common/oauth2/nativeclient';
 const AUTH_ENDPOINT = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize';
@@ -130,14 +133,22 @@ if (chrome.sidePanel?.setPanelBehavior) {
 
 // ============== State Persistence ==============
 async function saveState() {
-  await chrome.storage.local.set({
+  const payload = {
     sw_queue: accountsQueue, sw_current: currentAccount,
     sw_tabId: currentTabId, sw_results: results, sw_running: isRunning,
     sw_paused: isPaused, sw_mode: currentMode, sw_settings: settings,
     sw_backupEmailCursor: backupEmailCursor
-  });
+  };
+  await chrome.storage.local.set(payload);
+  stateDirty = false;
 }
 async function loadState() {
+  // Never clobber unpersisted in-memory mutations (root cause of skip loop).
+  if (stateDirty) return;
+  // Live batch in memory: prefer memory over storage to avoid races with concurrent handlers.
+  if (isRunning || isPaused || currentAccount || accountsQueue.length > 0) {
+    return;
+  }
   const d = await chrome.storage.local.get([
     'sw_queue', 'sw_current', 'sw_tabId', 'sw_results',
     'sw_running', 'sw_paused', 'sw_mode', 'sw_settings', 'sw_backupEmailCursor'
@@ -151,6 +162,9 @@ async function loadState() {
   currentMode = d.sw_mode || 'auto';
   settings = d.sw_settings || {};
   if (typeof d.sw_backupEmailCursor === 'number') backupEmailCursor = d.sw_backupEmailCursor;
+}
+function markDirty() {
+  stateDirty = true;
 }
 
 // ============== Message Handler ==============
@@ -176,6 +190,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (currentTabId) {
           try { await chrome.tabs.sendMessage(currentTabId, { action: 'skipCurrentStep' }); } catch(e) {}
         }
+        break;
+      case 'skipToNextAccount':
+        await skipToNextAccount(msg.reason || '用户手动切换到下一个账号');
         break;
       case 'reopenAuth':
         // Content script detected backup-email verified / expired-code page.
@@ -240,33 +257,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
         }
         break;
-      case 'matchMaskedEmail':
-        const masked = msg.maskedEmail || '';
-        const [maskLocal, maskDomain] = masked.split('@');
+      case 'matchMaskedEmail': {
+        const masked = String(msg.maskedEmail || '').replace(/\s+/g, '');
+        const at = masked.indexOf('@');
         let matched = null;
-        if (maskLocal && maskDomain) {
-            let list = parseFixedBackupList(settings);
-            if (!list || list.length === 0) {
-              const res1 = await chrome.storage.local.get('backupEmailList');
-              list = parseFixedBackupList({ backupEmailList: res1.backupEmailList });
+        if (at > 0) {
+          const maskLocal = masked.slice(0, at);
+          const maskDomain = masked.slice(at + 1);
+          // 优先读 options 最新配置，再回落到内存 settings
+          const live = await chrome.storage.local.get(['backupEmailList', 'backupEmail', 'backupEmailMode']);
+          let list = parseFixedBackupList(live);
+          if (!list.length) list = parseFixedBackupList(settings);
+          const prefix = maskLocal.replace(/\*/g, '').toLowerCase();
+          const pureDomain = maskDomain.toLowerCase();
+          sendLog(`[匹配] 池 ${list.length} 个，掩码前缀 '${prefix}'，域名 '${pureDomain}'`, 'info');
+          if (prefix) {
+            for (const e of list) {
+              const email = String(e || '').trim();
+              const i = email.indexOf('@');
+              if (i <= 0) continue;
+              const local = email.slice(0, i).toLowerCase();
+              const domain = email.slice(i + 1).toLowerCase();
+              if (domain === pureDomain && local.startsWith(prefix)) {
+                matched = email;
+                break;
+              }
             }
-            if (!list || list.length === 0) {
-              const res2 = await chrome.storage.local.get('sw_settings');
-              list = parseFixedBackupList(res2.sw_settings || {});
-            }
-            const prefix = maskLocal.replace(/\*/g, '').replace(/\s+/g, '').toLowerCase();
-            const pureDomain = maskDomain.replace(/\s+/g, '').toLowerCase();
-            sendLog(`[匹配调试] 当前池 ${list.length} 个，寻找前缀 '${prefix}', 域名 '${maskDomain}'`, 'info');
-            for (let e of list) {
-                const [l, d] = e.split('@');
-                if (d && d.replace(/s+/g, '').toLowerCase() === pureDomain && l.toLowerCase().startsWith(prefix)) {
-                    matched = e;
-                    break;
-                }
-            }
+          }
+          // 命中后写回当前账号，确保后续接码 API 用对地址
+          if (matched && currentAccount) {
+            currentAccount.backupEmail = matched;
+            await saveState();
+            sendLog(`[匹配] 已将当前账号备用邮箱更新为 ${matched}`, 'success');
+          } else if (!matched) {
+            sendLog(`[匹配] 未找到与 ${masked} 匹配的备用邮箱`, 'warning');
+          }
         }
         sendResponse(matched);
         break;
+      }
       case 'log':
         sendLog(msg.message, msg.level);
         break;
@@ -502,9 +531,12 @@ async function executeStep4() {
       });
     } catch (err) {
       // If we already recorded success for this email, swallow expired-code noise.
-      await loadState();
+      // Do not loadState here — it can resurrect a just-cleared currentAccount / unshifted queue.
       if (results.some((r) => r.success && r.email === snap.email && r.token)) {
         sendLog(`[${snap.email}] 忽略过期授权码错误（令牌已成功获取）`, 'info');
+        if (!currentAccount && !isPaused && isRunning) {
+          setTimeout(() => processNext(), 500);
+        }
         return;
       }
       broadcastStep(4, 'error', snap.email);
@@ -548,12 +580,14 @@ async function startProcess(accounts) {
   currentAccount = null;
   claimedAuthCodes.clear();
   backupEmailCursor = 0;
+  markDirty();
   if (currentTabId) { chrome.tabs.remove(currentTabId).catch(() => {}); currentTabId = null; }
 
   accountsQueue = accounts.map(a => {
     const p = a.split(/----|:|\|/);
     return { email: p[0]?.trim(), password: p[1]?.trim() };
   }).filter(a => a.email && a.password);
+  markDirty();
 
   // Clean old PKCE data
   chrome.storage.local.get(null, all => {
@@ -637,33 +671,57 @@ async function resumeProcess(mode) {
 
 // ============== Process Next Account ==============
 async function processNext() {
-  await loadState();
+  // On SW cold start memory is empty — restore once. While a batch is live in
+  // memory, never loadState here: concurrent handlers' loadState can otherwise
+  // resurrect a just-shifted account and spam "本批已成功，跳过".
+  if (!isRunning && accountsQueue.length === 0 && !currentAccount) {
+    await loadState();
+  }
   if (isPaused) return;
-  if (!isRunning || accountsQueue.length === 0) {
+  if (!isRunning) return;
+
+  // Drain any already-succeeded accounts without tight setTimeout loops.
+  while (accountsQueue.length > 0) {
+    const head = accountsQueue[0];
+    if (results.some((r) => r.success && r.email === head.email && r.token)) {
+      accountsQueue.shift();
+      markDirty();
+      sendLog(`[${head.email}] 本批已成功，跳过`, 'info');
+      continue;
+    }
+    break;
+  }
+  // Persist queue after draining so loadState cannot restore stale heads.
+  await saveState();
+
+  if (accountsQueue.length === 0) {
     isRunning = false;
     isPaused = false;
+    currentAccount = null;
+    markDirty();
+    await saveState();
     broadcastToPopup({ type: 'finished', results: results });
     chrome.storage.local.set({ sw_running: false, sw_paused: false });
     sendLog('所有账号已处理完毕！', 'success');
-    // Clean up state flags
     await chrome.storage.local.remove(['sw_running', 'sw_paused', 'sw_current', 'sw_tabId', 'sw_queue']);
     return;
   }
 
   const account = accountsQueue.shift();
-  // Skip accounts already successfully finished in this batch (reopen/retry safety).
-  if (results.some((r) => r.success && r.email === account.email && r.token)) {
-    sendLog(`[${account.email}] 本批已成功，跳过`, 'info');
-    setTimeout(() => processNext(), 300);
-    return;
-  }
+  // Save immediately after shift so any concurrent loadState sees the shorter queue.
+  currentAccount = null;
+  markDirty();
+  await saveState();
 
   const clientId = getClientId();
   // Refresh settings so multi-list edits from options take effect mid-batch.
   const live = await chrome.storage.local.get([
     'backupEmail', 'backupEmailList', 'backupEmailMode', 'backupEmailDomain',
-    'clientIdMode', 'customClientId', 'tempEmailEnabled', 'tempEmailApiUrl', 'tempEmailAdminPassword'
+    'clientIdMode', 'customClientId', 'tempEmailEnabled', 'tempEmailApiUrl',
+    'tempEmailAdminPassword', 'apiMode'
   ]);
+  // Re-load queue/current only if another path mutated storage mid-await — but keep our shift.
+  // Prefer memory for queue/current; only merge settings from live.
   settings = { ...settings, ...live };
   const backupEmail = resolveBackupEmail(settings);
   currentAccount = { ...account, clientId, backupEmail };
@@ -693,7 +751,13 @@ async function processNext() {
 
   const params = { url: authUrl };
   if (currentTabId) {
-    chrome.tabs.update(currentTabId, { url: authUrl });
+    try {
+      await chrome.tabs.get(currentTabId);
+      chrome.tabs.update(currentTabId, { url: authUrl });
+    } catch (_) {
+      currentTabId = null;
+      chrome.tabs.create(params, tab => { currentTabId = tab.id; saveState(); });
+    }
   } else {
     chrome.tabs.create(params, tab => { currentTabId = tab.id; saveState(); });
   }
@@ -708,17 +772,81 @@ async function processNext() {
   }, 3000);
 }
 
+// ============== Manual skip to next account ==============
+async function skipToNextAccount(reason = '用户手动切换到下一个账号') {
+  // Prefer in-memory state; only fill gaps from storage if SW was just woken.
+  if (!isRunning && !isPaused && !currentAccount && accountsQueue.length === 0) {
+    await loadState();
+  }
+  if (!currentAccount && accountsQueue.length === 0) {
+    sendLog('没有可切换的账号', 'warning');
+    return;
+  }
+
+  step4Lock = false;
+  const email = currentAccount?.email;
+
+  // Close current auth tab so the next account starts clean.
+  if (currentTabId) {
+    const tabToClose = currentTabId;
+    currentTabId = null;
+    chrome.tabs.remove(tabToClose).catch(() => {});
+  }
+
+  if (currentAccount) {
+    const alreadyOk = results.some((r) => r.success && r.email === currentAccount.email && r.token);
+    if (!alreadyOk) {
+      // Mark incomplete account as skipped (not a hard failure noise if user just wants next).
+      const skipped = {
+        success: false,
+        email: currentAccount.email,
+        password: currentAccount.password || '',
+        clientId: currentAccount.clientId || '',
+        backupEmail: currentAccount.backupEmail || '',
+        error: reason
+      };
+      results = results.filter((r) => !(r.email === skipped.email && !r.success));
+      results.push(skipped);
+      markDirty();
+      broadcastToPopup({ type: 'accountResult', result: skipped });
+      sendLog(`[${skipped.email}] ⏭ ${reason}`, 'warning');
+    } else {
+      sendLog(`[${currentAccount.email}] ⏭ 已有成功结果，切换下一账号`, 'info');
+    }
+    currentAccount = null;
+    markDirty();
+  } else {
+    sendLog(`⏭ ${reason}`, 'warning');
+  }
+
+  // Ensure running so processNext will continue (works from paused too).
+  isPaused = false;
+  isRunning = true;
+  markDirty();
+  await saveState();
+  broadcastToPopup({ type: 'resumed', account: null, remaining: accountsQueue.length });
+  setTimeout(() => processNext(), 400);
+}
+
 // ============== Finish Current Account ==============
 async function finishAccount(result) {
-  await loadState();
+  // Snapshot before any await: concurrent loadState must not resurrect a finished account.
   const saved = currentAccount;
+  let shouldAdvance = false;
 
-  // Concurrent finish (e.g. double auto step-4): already cleared — skip quietly.
   if (!saved) {
     if (!result?.email) return;
-    if (results.some((r) => r.email === result.email && r.token === result.token && r.success === result.success)) return;
+    // Already finished this exact outcome — still try to advance if queue remains.
+    if (results.some((r) => r.email === result.email && r.token === result.token && r.success === result.success)) {
+      if (!isPaused && isRunning && !currentAccount) {
+        setTimeout(() => processNext(), 500);
+      }
+      return;
+    }
   } else {
     currentAccount = null;
+    markDirty();
+    shouldAdvance = true;
   }
 
   if (!result.password && saved) result.password = saved.password || '';
@@ -731,20 +859,26 @@ async function finishAccount(result) {
     const existingSuccess = results.find((r) => r.success && r.email === result.email && r.token);
     if (existingSuccess) {
       sendLog(`[${result.email}] 忽略失败结果（已有成功令牌）: ${String(result.error || '').slice(0, 80)}`, 'info');
+      await saveState();
       if (!isPaused && isRunning) setTimeout(() => processNext(), 500);
       return;
     }
   } else {
     // Drop any prior FAILED rows for this email in current batch display storage.
     results = results.filter((r) => !(r.email === result.email && !r.success));
+    markDirty();
   }
 
   const lineKey = `${result.email}|${result.success}|${result.token || result.error || ''}`;
   if (results.some((r) => `${r.email}|${r.success}|${r.token || r.error || ''}` === lineKey)) {
+    // Duplicate finish must still advance the queue (was the main stuck-after-success bug).
+    await saveState();
+    if (!isPaused && isRunning) setTimeout(() => processNext(), 500);
     return;
   }
 
   results.push(result);
+  markDirty();
   await saveState();
 
   if (result.success) {
@@ -756,7 +890,10 @@ async function finishAccount(result) {
   broadcastToPopup({ type: 'accountResult', result });
 
   if (isPaused) return;
-  setTimeout(() => processNext(), 2000);
+  // Always advance after a terminal finish when still running.
+  if (shouldAdvance || isRunning) {
+    setTimeout(() => processNext(), 1500);
+  }
 }
 
 // ============== Stop (full cancel) ==============

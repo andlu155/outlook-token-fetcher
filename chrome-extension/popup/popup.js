@@ -10,6 +10,7 @@ document.addEventListener('DOMContentLoaded', () => {
     resumeBtn: $('resumeBtn'),
     stopBtn: $('stopBtn'),
     skipBtn: $('skipBtn'),
+    nextAccountBtn: $('nextAccountBtn'),
     settingsBtn: $('settingsBtn'),
     logContainer: $('logContainer'),
     clearLogBtn: $('clearLogBtn'),
@@ -142,6 +143,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (els.resumeBtn) els.resumeBtn.disabled = !paused;
     els.stopBtn.disabled = !(running || paused);
     els.skipBtn.disabled = !running;
+    // 下一个账号：自动/逐步骤/暂停均可点，强制切到队列下一号
+    if (els.nextAccountBtn) els.nextAccountBtn.disabled = !(running || paused);
     els.accountInput.disabled = running;
   }
 
@@ -180,6 +183,14 @@ document.addEventListener('DOMContentLoaded', () => {
   els.skipBtn.addEventListener('click', () => {
     chrome.runtime.sendMessage({ action: 'skipCurrentStep' });
     addLog('已发送跳过指令', 'warning');
+  });
+
+  els.nextAccountBtn?.addEventListener('click', () => {
+    addLog('⏭ 正在切换到下一个账号...', 'warning');
+    setUiState('running');
+    resetSteps();
+    setStep(1, 'active');
+    chrome.runtime.sendMessage({ action: 'skipToNextAccount', reason: '用户手动切换到下一个账号' });
   });
 
   els.settingsBtn.addEventListener('click', () => chrome.runtime.openOptionsPage());
