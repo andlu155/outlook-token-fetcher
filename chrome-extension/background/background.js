@@ -692,7 +692,7 @@ async function maybeProbeErrorPage(tabId, url, title, statusComplete = false) {
 /** Hard SSL/network errors should re-run the whole account, not blank-hop. */
 function isHardNetworkError(reason) {
   const s = String(reason || '');
-  return /ERR_SSL|ERR_CONNECTION|ERR_TIMED_OUT|ERR_NAME_NOT|ERR_NETWORK|ERR_TUNNEL|ERR_PROXY|ERR_CERT|ERR_EMPTY|ERR_INTERNET|ERR_ADDRESS|ERR_HTTP2|chrome-error|无法提供安全连接|安全连接|响应无效|title:.*安全|probe-inject-failed|content-error-page|webNavigation-error/i.test(s);
+  return /ERR_SSL|ERR_CONNECTION|ERR_TIMED_OUT|ERR_NAME_NOT|ERR_NETWORK|ERR_TUNNEL|ERR_PROXY|ERR_CERT|ERR_EMPTY|ERR_INTERNET|ERR_ADDRESS|ERR_HTTP2|chrome-error|无法提供安全连接|安全连接|响应无效|title:.*安全|probe-inject-failed|content-error-page|webNavigation-error|too\s*many\s*requests|请求过多|rate\s*limit|throttl|http\s*429/i.test(s);
 }
 
 /**

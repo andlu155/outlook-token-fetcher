@@ -9,6 +9,9 @@ let checkTimer = null;
 let lastAction = '';
 let lastPageKind = '';
 let execMode = 'auto';
+// True while fetchVerificationCode is in flight — blocks concurrent re-entry
+// (MutationObserver used to re-trigger fill while the 3s wait left the box empty).
+let codeFetchInFlight = false;
 // Rate-limit local page-error recovery reports (background has its own cap).
 let lastErrorReportAt = 0;
 const ERROR_REPORT_COOLDOWN_MS = 5000;
@@ -83,6 +86,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (msg.step === 2 || msg.step === 3) {
       lastAction = '';
       lastPageKind = '';
+      codeFetchInFlight = false;
     }
     if (msg.step === 2) executeStep2();
     if (msg.step === 3) executeStep3();
@@ -460,6 +464,43 @@ function isBrowserErrorPage(body) {
   return false;
 }
 
+/**
+ * Microsoft / CDN rate-limit interstitial (often a nearly blank page with only
+ * "Too Many Requests"). Skip account — reopening usually hits the same limit.
+ * Returns a short reason string, or null.
+ */
+function detectRateLimitPage(body = pageText()) {
+  const title = String(document.title || '');
+  const text = String(body || '');
+  const hay = (title + ' | ' + text).slice(0, 4000);
+
+  const rules = [
+    { re: /too\s*many\s*requests/i, label: 'Too Many Requests' },
+    { re: /请求过多|请求次数过多|请求太频繁|访问过于频繁|访问次数过多|操作过于频繁|频率过高/i, label: '请求过多' },
+    { re: /rate\s*limit(?:ed|ing)?|throttl(?:e|ed|ing)|http\s*429|status\s*code\s*429/i, label: 'rate limited' }
+  ];
+  for (const { re, label } of rules) {
+    if (re.test(hay)) {
+      const fromTitle = title && re.test(title) ? title.trim() : '';
+      const fromBody = (text.match(re) || [])[0] || '';
+      return (fromTitle || fromBody || label).replace(/\s+/g, ' ').trim().slice(0, 120);
+    }
+  }
+  return null;
+}
+
+/** Skip current account after rate-limit / 429 page (uses existing SW skipAccount). */
+function handleRateLimitSkip(source, message) {
+  if (lastAction === 'rate-limit-skip') return;
+  lastAction = 'rate-limit-skip';
+  const reason = String(message || 'Too Many Requests').replace(/\s+/g, ' ').trim().slice(0, 160);
+  sendLog(`${source}：检测到请求过多/限流（${reason}），跳过当前账号`, 'error');
+  chrome.runtime.sendMessage({
+    action: 'skipAccount',
+    reason: `请求过多: ${reason}`
+  }).catch(() => {});
+}
+
 /** Meaningful login / proof / code UI — never treat as blank. */
 function hasAuthFlowUi() {
   // Password / email / proof / submit — any of these means a normal MS login step.
@@ -529,6 +570,12 @@ function detectAndRecoverErrorPage() {
     if (!isTopFrame()) return false;
 
     const body = pageText();
+    // Rate-limit interstitial → skip account (do not reopen / blank-recover).
+    const rateLimit = detectRateLimitPage(body);
+    if (rateLimit) {
+      handleRateLimitSkip('异常检测', rateLimit);
+      return true;
+    }
     const errPage = isBrowserErrorPage(body);
     // Hard SSL/network errors: sustain only (no stuck gate — error page is already stuck).
     // Soft blank: only after task stuck ≥ STUCK_MS (checked inside isNearlyBlankPage).
@@ -589,6 +636,12 @@ function classifyPage() {
   const codeInputs = getCodeInputs();
   const proofInput = getProofEmailInput();
 
+  // Rate-limit before blank/error — short "Too Many Requests" pages look blank otherwise.
+  if (isTopFrame()) {
+    const rateMsg = detectRateLimitPage(body);
+    if (rateMsg) return { kind: 'rate-limit', message: rateMsg };
+  }
+
   // Hard SSL/network errors first. Soft blank only when stuck (see isNearlyBlankPage).
   if (isTopFrame() && (isBrowserErrorPage(body) || isNearlyBlankPage())) {
     return { kind: 'page-error' };
@@ -614,7 +667,12 @@ function classifyPage() {
 
   if (accountTile) return { kind: 'account-tile', accountTile };
   if (emailInput) return { kind: 'login-email', emailInput };
-  if (passwordInput) return { kind: 'login-password', passwordInput };
+  if (passwordInput) {
+    // Wrong password / password login unavailable / too many attempts → skip account.
+    const pwdFail = detectPasswordLoginFailure(body);
+    if (pwdFail) return { kind: 'password-error', message: pwdFail, passwordInput };
+    return { kind: 'login-password', passwordInput };
+  }
 
   // After successful backup-email verify, expired-code page → reopen auth.
   if (isCodeExpiredPage(body)) {
@@ -678,6 +736,10 @@ function handleSkip() {
       return sendLog('跳过：请在页面上手动填写 Outlook 邮箱', 'warning');
     case 'login-password':
       return sendLog('跳过：请在页面上手动填写 Outlook 密码', 'warning');
+    case 'password-error':
+      return handlePasswordLoginFailure('跳过', page.message);
+    case 'rate-limit':
+      return handleRateLimitSkip('跳过', page.message);
     case 'code':
       return sendLog('跳过：请手动输入备用邮箱验证码', 'warning');
     case 'proof-initial':
@@ -700,10 +762,89 @@ function handleSkip() {
   }
 }
 
+/** Visible error nodes near the password form (MS often uses #passwordError). */
+function collectPasswordErrorSnippets() {
+  const selectors = [
+    '#passwordError',
+    '#usernameError',
+    '#idTd_Tile_ErrorMsg_Login',
+    '[id*="passwordError" i]',
+    '[id*="Error" i]',
+    '[role="alert"]',
+    '[aria-live="assertive"]',
+    '.alert-error',
+    '[class*="error" i]'
+  ];
+  const texts = [];
+  for (const sel of selectors) {
+    try {
+      for (const el of document.querySelectorAll(sel)) {
+        if (!isVisible(el)) continue;
+        const t = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t && t.length < 300) texts.push(t);
+      }
+    } catch (_) {}
+  }
+  return texts;
+}
+
+/**
+ * Detect password-page hard failures that should skip the account:
+ * - 密码登录不可用
+ * - 不正确的帐户或密码 / 次数过多
+ * - common EN variants
+ * Returns a short reason string, or null.
+ */
+function detectPasswordLoginFailure(body = pageText()) {
+  const snippets = collectPasswordErrorSnippets();
+  const hay = (snippets.join(' | ') + ' | ' + String(body || '')).slice(0, 6000);
+
+  const rules = [
+    { re: /密码登录不可用/i, label: '密码登录不可用' },
+    { re: /不正确的帐户或密码.*次数过多|次数过多.*不正确的帐户或密码|尝试登录的次数过多/i, label: '登录次数过多' },
+    { re: /你使用不正确的帐户或密码/i, label: '帐户或密码不正确（次数过多）' },
+    { re: /帐户或密码不正确|账户或密码不正确|密码不正确|密码错误/i, label: '帐户或密码不正确' },
+    { re: /Your account or password is incorrect/i, label: 'account or password incorrect' },
+    { re: /password is incorrect|incorrect password/i, label: 'password incorrect' },
+    { re: /too many times|too many (failed )?sign-?in attempts|too many attempts/i, label: 'too many sign-in attempts' },
+    { re: /sign-?in (is )?temporarily (blocked|locked)|暂时(无法|不能)登录|登录暂时被阻止/i, label: 'sign-in temporarily blocked' }
+  ];
+
+  for (const { re, label } of rules) {
+    if (re.test(hay)) {
+      // Prefer the concrete UI snippet when available.
+      const hit = snippets.find((s) => re.test(s));
+      return hit || label;
+    }
+  }
+  return null;
+}
+
+/** Skip current account after password login hard-fail (uses existing SW skipAccount). */
+function handlePasswordLoginFailure(source, message) {
+  if (lastAction === 'password-error-skip') return;
+  lastAction = 'password-error-skip';
+  const reason = String(message || '密码错误或登录次数过多').replace(/\s+/g, ' ').trim().slice(0, 160);
+  sendLog(`${source}：检测到密码登录失败（${reason}），跳过当前账号`, 'error');
+  chrome.runtime.sendMessage({
+    action: 'skipAccount',
+    reason: `密码登录失败: ${reason}`
+  }).catch(() => {});
+}
+
 // Step 2: account tile / Outlook email / Outlook password / keep-signed-in / passkey
 function executeStep2() {
   const page = classifyPage();
   notePageChange(page.kind);
+
+  if (page.kind === 'password-error') {
+    handlePasswordLoginFailure('步骤 2/4', page.message);
+    return;
+  }
+  if (page.kind === 'rate-limit') {
+    handleRateLimitSkip('步骤 2/4', page.message);
+    return;
+  }
 
   if (page.kind === 'account-tile') {
     if (lastAction === 'account-tile') return;
@@ -806,6 +947,11 @@ function handleHumanCheck(source, holdBtn) {
 function executeStep3() {
   const page = classifyPage();
   notePageChange(page.kind);
+
+  if (page.kind === 'rate-limit') {
+    handleRateLimitSkip('步骤 3/4', page.message);
+    return;
+  }
 
   // Passkey may appear after verification code — cancel here too.
   if (page.kind === 'passkey') {
@@ -917,17 +1063,35 @@ function executeStep3() {
 }
 
 function fillVerificationCode(codeInputs) {
+  // Single-flight: ignore re-entry while a fetch/poll is already running.
+  if (codeFetchInFlight) return;
+
   // Allow retry if previous fill left the box empty (input was missing / React rejected).
   if (lastAction === 'verification-code') {
     const existing = getCodeInputs();
     const hasValue = existing.some((el) => String(el.value || '').replace(/\s/g, '').length >= 4);
     if (hasValue) return;
-    // Locked with empty box — unlock and try again (or wait for inputs).
+    // Locked with empty box and no in-flight fetch — unlock and try again.
     lastAction = '';
   }
   lastAction = 'verification-code';
+  codeFetchInFlight = true;
+  // Safety: SW poll is ~3s + 20×3s; if callback never returns, unlock for retry.
+  const fetchGuard = setTimeout(() => {
+    if (codeFetchInFlight) {
+      codeFetchInFlight = false;
+      lastAction = '';
+      sendLog('步骤 3/4：取码超时未回调，已解锁可重试', 'warning');
+    }
+  }, 75000);
   sendLog('步骤 3/4：正在获取备用邮箱验证码...', 'info');
   chrome.runtime.sendMessage({ action: 'fetchVerificationCode' }, (code) => {
+    clearTimeout(fetchGuard);
+    codeFetchInFlight = false;
+    if (chrome.runtime.lastError) {
+      lastAction = '';
+      return sendLog(`步骤 3/4：取码失败: ${chrome.runtime.lastError.message}`, 'warning');
+    }
     if (!code) {
       lastAction = '';
       return sendLog('步骤 3/4：未获取到验证码，请手动输入', 'warning');
@@ -990,6 +1154,18 @@ async function checkPageState() {
 
   if (page.kind === 'page-error') {
     detectAndRecoverErrorPage();
+    return;
+  }
+
+  // Password hard-fail → skip account (auto + step-by-step).
+  if (page.kind === 'password-error') {
+    handlePasswordLoginFailure(execMode === 'auto' ? '自动' : '检测', page.message);
+    return;
+  }
+
+  // Rate-limit / 429 → skip account (auto + step-by-step).
+  if (page.kind === 'rate-limit') {
+    handleRateLimitSkip(execMode === 'auto' ? '自动' : '检测', page.message);
     return;
   }
 
