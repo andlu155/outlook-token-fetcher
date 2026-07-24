@@ -9,18 +9,76 @@ let checkTimer = null;
 let lastAction = '';
 let lastPageKind = '';
 let execMode = 'auto';
+// Rate-limit local page-error recovery reports (background has its own cap).
+let lastErrorReportAt = 0;
+const ERROR_REPORT_COOLDOWN_MS = 5000;
+// Only recover after continuous hard error, or blank + task stuck, for this long.
+const ANOMALY_SUSTAIN_MS = 3000;
+// Soft blank only after no automation progress this long (login hops need more than 3s).
+const STUCK_MS = 10000;
+// After pagehide / unload, ignore soft blank (email→password transition flash).
+const NAV_GRACE_MS = 6000;
+let anomalyFirstSeenAt = 0;
+let anomalyPendingLog = false;
+let lastProgressAt = Date.now();
+let lastNavAt = 0;
+let lastHeartbeatAt = 0;
+// Slightly slower interaction pacing to reduce automation / risk-control signals.
+const PAGE_CHECK_DEBOUNCE_MS = 750;
+const FILL_TO_SUBMIT_MS = 1100;
+const FILL_TO_SUBMIT_JITTER_MS = 400;
 
-startObserver();
-setTimeout(checkPageState, 1000);
+function humanDelay(baseMs, jitterMs = 300) {
+  return baseMs + Math.floor(Math.random() * Math.max(0, jitterMs));
+}
+
+function isTopFrame() {
+  try {
+    return window === window.top;
+  } catch (_) {
+    return true;
+  }
+}
+
+function markProgress() {
+  lastProgressAt = Date.now();
+  clearAnomalyWatch();
+  // Sync progress to SW so soft-blank probe there also resets (throttle ~1.2s).
+  const now = Date.now();
+  if (isTopFrame() && now - lastHeartbeatAt > 1200) {
+    lastHeartbeatAt = now;
+    chrome.runtime.sendMessage({ action: 'progressHeartbeat' }).catch(() => {});
+  }
+}
+
+function isTaskStuck() {
+  return Date.now() - lastProgressAt >= STUCK_MS;
+}
+
+function isInNavGrace() {
+  return lastNavAt > 0 && Date.now() - lastNavAt < NAV_GRACE_MS;
+}
+
+// Blank/error recovery only in top frame (MS pages have empty iframes that false-trigger).
+if (isTopFrame()) {
+  startObserver();
+  setTimeout(checkPageState, 1200);
+  setTimeout(detectAndRecoverErrorPage, 2000);
+  setTimeout(detectAndRecoverErrorPage, 4500);
+}
 
 chrome.runtime.sendMessage({ action: 'getCurrentAccount' }, (account) => {
-  if (account?.email) currentAccount = account;
+  if (account?.email) {
+    currentAccount = account;
+    markProgress();
+  }
 });
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'skipCurrentStep') handleSkip();
   if (msg.action === 'executeStep') {
     if (msg.account?.email) currentAccount = msg.account;
+    markProgress();
     // Allow step 3 to run multiple times (backup email may need two passes).
     if (msg.step === 2 || msg.step === 3) {
       lastAction = '';
@@ -46,12 +104,24 @@ function startObserver() {
 
 function debouncedCheck() {
   clearTimeout(checkTimer);
-  checkTimer = setTimeout(checkPageState, 400);
+  checkTimer = setTimeout(checkPageState, PAGE_CHECK_DEBOUNCE_MS);
 }
 
 window.addEventListener('beforeunload', () => {
+  lastNavAt = Date.now();
+  markProgress();
   observer?.disconnect();
   clearTimeout(checkTimer);
+});
+
+// SPA / same-document hops and soft navigations during login.
+window.addEventListener('pagehide', () => {
+  lastNavAt = Date.now();
+  markProgress();
+});
+window.addEventListener('pageshow', () => {
+  lastNavAt = Date.now();
+  markProgress();
 });
 
 function sendLog(message, level = 'info') {
@@ -91,11 +161,27 @@ function findAllVisible(selector) {
 function typeVal(input, value) {
   if (!input) return;
   input.focus();
-  input.value = value;
+  // React / Fluent controlled inputs ignore plain .value= — use native setter.
+  try {
+    const proto = input instanceof HTMLTextAreaElement
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc?.set) {
+      desc.set.call(input, value);
+    } else {
+      input.value = value;
+    }
+  } catch (_) {
+    input.value = value;
+  }
   input.dispatchEvent(new Event('input', { bubbles: true }));
   input.dispatchEvent(new Event('change', { bubbles: true }));
+  input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+  input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Unidentified' }));
   input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
   input.dispatchEvent(new Event('blur', { bubbles: true }));
+  markProgress();
 }
 
 function clickEl(element) {
@@ -103,6 +189,7 @@ function clickEl(element) {
   element.focus?.();
   element.click();
   element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  markProgress();
 }
 
 function buttonText(el) {
@@ -157,13 +244,13 @@ function looksLikeEmailInput(el) {
 
 function looksLikeCodeInput(el) {
   if (!el || looksLikeEmailInput(el)) return false;
-  const meta = `${el.type || ''} ${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''}`.toLowerCase();
+  const meta = `${el.type || ''} ${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('aria-describedby') || ''}`.toLowerCase();
   const maxLen = Number(el.getAttribute('maxlength') || 0);
   return el.type === 'tel' ||
     el.type === 'number' ||
     maxLen === 1 ||
     maxLen === 6 ||
-    /otc|code|proofconfirmation|iOttText|验证码|代码/.test(meta);
+    /otc|code|proofconfirmation|iotttext|验证码|代码|security.?code|one-time/i.test(meta);
 }
 
 function getCodeInputs() {
@@ -174,7 +261,15 @@ function getCodeInputs() {
     'input[name*="otc" i]',
     'input[id*="code" i]',
     'input[name*="code" i]',
-    'input[id="iOttText"]'
+    'input[id="iOttText"]',
+    'input[autocomplete="one-time-code"]',
+    'input[inputmode="numeric"]',
+    'input[placeholder*="代码"]',
+    'input[placeholder*="验证码"]',
+    'input[placeholder*="code" i]',
+    'input[aria-label*="代码"]',
+    'input[aria-label*="验证码"]',
+    'input[aria-label*="code" i]'
   ].join(', ')).filter((el) => !looksLikeEmailInput(el));
   if (named.length) return named;
 
@@ -182,6 +277,24 @@ function getCodeInputs() {
   const digitBoxes = findAllVisible('input[maxlength="1"], input[autocomplete="one-time-code"]')
     .filter((el) => el.type !== 'password' && el.name !== 'loginfmt' && !looksLikeEmailInput(el));
   if (digitBoxes.length >= 4) return digitBoxes;
+
+  // Modern "输入代码" page: single plain text field, no code/otc id.
+  const body = pageText();
+  if (/输入你的代码|输入代码|输入验证码|enter your code|enter the code|security code/i.test(body)) {
+    const singles = findAllVisible(
+      'input[type="text"], input[type="tel"], input[type="number"], input:not([type])'
+    ).filter((el) => {
+      if (looksLikeEmailInput(el) || el.name === 'loginfmt' || el.type === 'password') return false;
+      if (looksLikeCodeInput(el)) return true;
+      // Lone non-email text box on an enter-code page.
+      return true;
+    });
+    if (singles.length === 1) return singles;
+    // Prefer the focused / empty one if multiple.
+    const empty = singles.filter((el) => !String(el.value || '').trim());
+    if (empty.length === 1) return empty;
+    if (singles.length) return [singles[0]];
+  }
 
   return [];
 }
@@ -208,9 +321,38 @@ function isProofInitialPage(body, proofInput) {
   return /让我们来保护你的帐户|保护你的帐户|备用电子邮件|备用邮箱|添加另一种方法|安全信息|someone@example.com/i.test(body);
 }
 
+// Intermediate risk-control page: choose where to send the security code (dropdown + 下一步).
+// Copy like "如果保护过度… / 我们应该将代码发送到什么地方？" — no code input yet.
+function isCodeSendMethodPage(body) {
+  const text = String(body || '');
+  // Strong Chinese copy from the protection / channel picker page.
+  if (/如果保护过度|我们可以电话联系|可以电话联系我们/i.test(text)
+    && /代码发送到什么地方|将代码发送到|发送到什么地方/i.test(text)) {
+    return true;
+  }
+  if (/我们应该将代码发送到什么地方|Where should we send (?:a |your )?code|How do you want to get (?:your )?code/i.test(text)) {
+    return true;
+  }
+  // Dropdown "向 xxx 发送电子邮件" + "我已有验证码" without an actual code box.
+  const hasChannelCopy = /向\s*\S+@\S+\s*发送(?:电子)?邮件|Send (?:an )?email to|发送电子邮件/i.test(text)
+    && /我已有验证码|I (?:already )?have (?:a |the )?code/i.test(text);
+  if (hasChannelCopy) {
+    const codeInputs = getCodeInputs();
+    const hasRealCodeBox = codeInputs.length >= 1 && (
+      codeInputs.length >= 4 || codeInputs.every(looksLikeCodeInput)
+    );
+    if (!hasRealCodeBox && !/输入你的代码|输入代码|输入验证码|enter your code|enter the code/i.test(text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isCodePage(body, codeInputs, proofInput) {
   // Figure 5 re-verify page also mentions "代码/验证码"; never treat it as code entry.
   if (isProofResendPage(body, proofInput)) return false;
+  // Channel picker ("where should we send the code?") is not a fillable code page.
+  if (isCodeSendMethodPage(body)) return false;
   // Expired-code banner means backup email already verified — not a fillable code page.
   if (isCodeExpiredPage(body)) return false;
 
@@ -277,7 +419,7 @@ function dismissPasskeyPage(source = 'auto') {
         cancel.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
         cancel.click();
       } catch (_) {}
-    }, 200);
+    }, humanDelay(400, 200));
     sendLog(`${source}：检测到设置密钥页面，已点击取消`, 'info');
     return true;
   }
@@ -309,6 +451,135 @@ function findHoldButton() {
     || null;
 }
 
+function isBrowserErrorPage(body) {
+  const text = String(body || '');
+  if (/ERR_[A-Z0-9_]+/.test(text)) return true;
+  if (/chrome-error:\/\/|chromewebdata/i.test(location.href || '')) return true;
+  if (/无法提供安全连接|此网站无法提供安全连接|安全连接|响应无效|无法访问此网站|网页无法打开|连接已重置|连接超时|暂时无法访问|没有互联网连接|隐私错误|您的连接不是私密连接/i.test(text)) return true;
+  if (/this site can.?t (be reached|provide a secure connection)|your connection is not private|net::err_|dns_probe_finished|err_ssl|err_connection|err_timed_out|err_name_not_resolved|err_empty_response|err_tunnel|err_proxy|err_cert/i.test(text)) return true;
+  return false;
+}
+
+/** Meaningful login / proof / code UI — never treat as blank. */
+function hasAuthFlowUi() {
+  // Password / email / proof / submit — any of these means a normal MS login step.
+  if (findVisible(
+    'input[name="loginfmt"], input[type="password"], input[type="email"], input[name="passwd"], ' +
+    '#i0116, #i0118, #idSIButton9, #otc, input[name="otc"], #proofConfirmationText, ' +
+    'input[name="ProofConfirmation"], input[name="EmailAddress"], input[id*="proof" i], ' +
+    'input[id*="email" i], input[aria-label*="邮箱"], input[aria-label*="email" i], ' +
+    'input[aria-label*="密码"], input[aria-label*="password" i], ' +
+    'input[placeholder*="邮箱"], input[placeholder*="email" i], input[placeholder*="密码"], ' +
+    'input[placeholder*="password" i], #msaTile, #idBtn_Back, #idBtn_Accept, form'
+  )) return true;
+
+  const body = pageText();
+  // Auth copy alone is enough when page is clearly a login step (even if input not yet painted).
+  if (/输入你的密码|输入密码|enter your password|enter password|输入你的电子邮件|输入电子邮件|sign in|登录|验证你的|验证码|保持登录|keep me signed|帐户已锁定|证明你不是机器人/i.test(body)) {
+    return true;
+  }
+  // Any visible text input + auth-ish copy (covers proof-email "验证你的电子邮件" layout).
+  const textInputs = findAllVisible(
+    'input[type="text"], input:not([type]), input[type="tel"], input[type="number"], textarea, input[type="password"], input[type="email"]'
+  );
+  if (textInputs.length && /验证|邮箱|email|code|验证码|发送|登录|sign in|password|密码|帐户|账户/i.test(body)) {
+    return true;
+  }
+  // Form with input + primary button is an active step, not a blank page.
+  if (textInputs.length && findVisible('button, input[type="submit"], input[type="button"], [role="button"]')) {
+    return true;
+  }
+  // Any primary action button with auth copy = not blank.
+  if (findVisible('button, input[type="submit"], input[type="button"], [role="button"]') &&
+      /下一步|继续|next|continue|登录|sign in|发送|提交|submit/i.test(body)) {
+    return true;
+  }
+  return false;
+}
+
+function isNearlyBlankPage() {
+  // Never evaluate blank inside iframes (MS embeds empty frames).
+  if (!isTopFrame()) return false;
+  if (document.readyState !== 'complete') return false;
+  // Ignore early navigation white flash + post-hop grace (email→password).
+  if (performance.now() < 4000) return false;
+  if (isInNavGrace()) return false;
+  // Soft blank only when automation has made no progress for STUCK_MS.
+  if (!isTaskStuck()) return false;
+  if (hasAuthFlowUi()) return false;
+
+  const body = pageText().replace(/\s+/g, ' ').trim();
+  // Password / email pages have short-ish copy; keep threshold low only for true empty shells.
+  if (body.length >= 40) return false;
+  // Error interstitials have buttons like Reload — still blank/broken if no auth UI.
+  const host = (location.hostname || '').toLowerCase();
+  const msHost = /login\.live\.com|login\.microsoftonline\.com|account\.live\.com|account\.microsoft\.com|live\.com|microsoft\.com|office\.com|outlook\./i.test(host)
+    || /^chrome-error:/i.test(location.href || '');
+  return msHost;
+}
+
+function clearAnomalyWatch() {
+  anomalyFirstSeenAt = 0;
+  anomalyPendingLog = false;
+}
+
+function detectAndRecoverErrorPage() {
+  try {
+    // Iframes must not drive recovery (false blank on nested frames).
+    if (!isTopFrame()) return false;
+
+    const body = pageText();
+    const errPage = isBrowserErrorPage(body);
+    // Hard SSL/network errors: sustain only (no stuck gate — error page is already stuck).
+    // Soft blank: only after task stuck ≥ STUCK_MS (checked inside isNearlyBlankPage).
+    const blank = !errPage && isNearlyBlankPage();
+    if (!errPage && !blank) {
+      clearAnomalyWatch();
+      return false;
+    }
+
+    const now = Date.now();
+    if (!anomalyFirstSeenAt) {
+      anomalyFirstSeenAt = now;
+      if (!anomalyPendingLog) {
+        anomalyPendingLog = true;
+        sendLog(
+          errPage
+            ? `检测到 SSL/网络错误页，持续 ${ANOMALY_SUSTAIN_MS / 1000}s 后自动恢复…`
+            : `任务已卡住 ${STUCK_MS / 1000}s 且页面异常（非正常登录页），持续 ${ANOMALY_SUSTAIN_MS / 1000}s 后自动恢复…`,
+          'warning'
+        );
+      }
+      return true;
+    }
+    if (now - anomalyFirstSeenAt < ANOMALY_SUSTAIN_MS) {
+      return true;
+    }
+    if (now - lastErrorReportAt < ERROR_REPORT_COOLDOWN_MS) return true;
+    lastErrorReportAt = now;
+    clearAnomalyWatch();
+
+    const reloadBtn = findAllVisible('button, a, input[type="button"], input[type="submit"]')
+      .find((el) => /重新加载|reload|刷新|retry|重试|try again/i.test(buttonText(el)));
+    if (reloadBtn) {
+      sendLog(`异常已持续 ${ANOMALY_SUSTAIN_MS / 1000}s，点击「${buttonText(reloadBtn).slice(0, 20)}」并请求后台恢复`, 'warning');
+      clickEl(reloadBtn);
+    } else {
+      sendLog(`异常已持续 ${ANOMALY_SUSTAIN_MS / 1000}s，请求后台重新打开授权页`, 'warning');
+    }
+
+    chrome.runtime.sendMessage({
+      action: 'pageErrorRecover',
+      reason: errPage ? (body.match(/ERR_[A-Z0-9_]+/)?.[0] || 'ssl-or-net-error') : 'blank-stuck',
+      url: location.href,
+      sustainedMs: ANOMALY_SUSTAIN_MS
+    }).catch(() => {});
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Strict mutual-exclusion page classifier.
 function classifyPage() {
   const body = pageText();
@@ -317,6 +588,11 @@ function classifyPage() {
   const accountTile = findVisible('#msaTile, div[aria-label*="Personal"], div[aria-label*="个人"]');
   const codeInputs = getCodeInputs();
   const proofInput = getProofEmailInput();
+
+  // Hard SSL/network errors first. Soft blank only when stuck (see isNearlyBlankPage).
+  if (isTopFrame() && (isBrowserErrorPage(body) || isNearlyBlankPage())) {
+    return { kind: 'page-error' };
+  }
 
   // Passkey/setup-key pages can appear mid-flow after password or after backup email.
   // Check early so they are not blocked by other heuristics.
@@ -343,6 +619,12 @@ function classifyPage() {
   // After successful backup-email verify, expired-code page → reopen auth.
   if (isCodeExpiredPage(body)) {
     return { kind: 'code-expired' };
+  }
+
+  // Risk-control channel picker: "where should we send the code?" → click 下一步.
+  // Must run before isCodePage so we don't try to fill a non-existent code box.
+  if (isCodeSendMethodPage(body)) {
+    return { kind: 'code-send-method', nextBtn: getSubmitButton() };
   }
 
   // Figure 5 first: "验证你的电子邮件" + email field + "发送验证码".
@@ -382,6 +664,10 @@ function notePageChange(kind) {
     lastPageKind = kind;
     lastAction = '';
   }
+  // Recognized interactive steps count as progress (cancels blank-stuck recovery).
+  if (kind && kind !== 'page-error' && kind !== 'none') {
+    markProgress();
+  }
 }
 
 function handleSkip() {
@@ -407,6 +693,8 @@ function handleSkip() {
       return sendLog('跳过：帐户已锁定，需手动点“下一步”并完成人机验证', 'warning');
     case 'human-check':
       return sendLog('人机验证需手动完成：请在页面上长按“按住”按钮', 'warning');
+    case 'code-send-method':
+      return sendLog('跳过：请手动选择代码发送方式并点“下一步”', 'warning');
     default:
       return sendLog('未检测到可跳过的登录步骤', 'warning');
   }
@@ -431,7 +719,7 @@ function executeStep2() {
     lastAction = 'login-email';
     sendLog(`步骤 2/4：填写 Outlook 邮箱 ${currentAccount.email}`, 'info');
     typeVal(page.emailInput, currentAccount.email);
-    setTimeout(() => clickEl(getSubmitButton()), 600);
+    setTimeout(() => clickEl(getSubmitButton()), humanDelay(FILL_TO_SUBMIT_MS, FILL_TO_SUBMIT_JITTER_MS));
     return;
   }
 
@@ -441,7 +729,7 @@ function executeStep2() {
     lastAction = 'login-password';
     sendLog('步骤 2/4：填写 Outlook 密码', 'info');
     typeVal(page.passwordInput, currentAccount.password);
-    setTimeout(() => clickEl(getSubmitButton()), 600);
+    setTimeout(() => clickEl(getSubmitButton()), humanDelay(FILL_TO_SUBMIT_MS, FILL_TO_SUBMIT_JITTER_MS));
     return;
   }
 
@@ -468,6 +756,11 @@ function executeStep2() {
     return;
   }
 
+  if (page.kind === 'code-send-method') {
+    handleCodeSendMethod('步骤 2/4', page.nextBtn);
+    return;
+  }
+
   sendLog('步骤 2/4：等待 Outlook 邮箱或密码页面', 'warning');
 }
 
@@ -481,6 +774,19 @@ function handleAccountLocked(source, nextBtn) {
     sendLog(`${source}：检测到“帐户已锁定”，已点击下一步（接下来请完成人机验证）`, 'warning');
   } else {
     sendLog(`${source}：检测到“帐户已锁定”，未找到下一步按钮，请手动点击`, 'warning');
+  }
+}
+
+// Risk-control: "where should we send the code?" dropdown page → click 下一步.
+function handleCodeSendMethod(source, nextBtn) {
+  if (lastAction === 'code-send-method') return;
+  lastAction = 'code-send-method';
+  const btn = nextBtn || getSubmitButton();
+  if (btn) {
+    clickEl(btn);
+    sendLog(`${source}：检测到代码发送方式页（备用邮箱风控），已点击下一步`, 'info');
+  } else {
+    sendLog(`${source}：检测到代码发送方式页，未找到下一步按钮，请手动点击`, 'warning');
   }
 }
 
@@ -514,6 +820,10 @@ function executeStep3() {
   }
   if (page.kind === 'human-check') {
     handleHumanCheck('步骤 3/4', page.holdBtn);
+    return;
+  }
+  if (page.kind === 'code-send-method') {
+    handleCodeSendMethod('步骤 3/4', page.nextBtn);
     return;
   }
 
@@ -564,7 +874,7 @@ function executeStep3() {
           page.kind === 'proof-resend' ? '步骤 3/4：已点击发送验证码' : '步骤 3/4：已点击下一步',
           'info'
         );
-      }, 600);
+      }, humanDelay(FILL_TO_SUBMIT_MS, FILL_TO_SUBMIT_JITTER_MS));
     };
 
     // 检查页面上是否提示了掩码邮箱 (例如 "我们将向 05*****@ldymail.cc.cd 发送代码")
@@ -607,7 +917,14 @@ function executeStep3() {
 }
 
 function fillVerificationCode(codeInputs) {
-  if (lastAction === 'verification-code') return;
+  // Allow retry if previous fill left the box empty (input was missing / React rejected).
+  if (lastAction === 'verification-code') {
+    const existing = getCodeInputs();
+    const hasValue = existing.some((el) => String(el.value || '').replace(/\s/g, '').length >= 4);
+    if (hasValue) return;
+    // Locked with empty box — unlock and try again (or wait for inputs).
+    lastAction = '';
+  }
   lastAction = 'verification-code';
   sendLog('步骤 3/4：正在获取备用邮箱验证码...', 'info');
   chrome.runtime.sendMessage({ action: 'fetchVerificationCode' }, (code) => {
@@ -616,31 +933,65 @@ function fillVerificationCode(codeInputs) {
       return sendLog('步骤 3/4：未获取到验证码，请手动输入', 'warning');
     }
     sendLog('步骤 3/4：已获取验证码，正在填写', 'success');
-    fillCode(code, codeInputs);
-    setTimeout(() => clickEl(getSubmitButton()), 600);
+    // Re-query inputs at fill time (DOM may have settled after fetch delay).
+    const liveInputs = getCodeInputs();
+    const targets = (liveInputs.length ? liveInputs : codeInputs) || [];
+    if (!targets.length) {
+      lastAction = '';
+      sendLog('步骤 3/4：未找到验证码输入框，将在页面就绪后重试', 'warning');
+      return;
+    }
+    fillCode(code, targets);
+    // Verify fill stuck; if React rejected it, retry once with re-query.
+    setTimeout(() => {
+      const check = getCodeInputs();
+      const filled = check.some((el) => String(el.value || '').replace(/\s/g, '').includes(String(code).slice(0, 3)));
+      if (!filled && check.length) {
+        sendLog('步骤 3/4：验证码框未写入，重试填写…', 'warning');
+        fillCode(code, check);
+      } else if (!filled && !check.length) {
+        lastAction = '';
+        sendLog('步骤 3/4：验证码框仍未就绪，稍后重试', 'warning');
+        return;
+      }
+      setTimeout(() => clickEl(getSubmitButton()), humanDelay(FILL_TO_SUBMIT_MS, FILL_TO_SUBMIT_JITTER_MS));
+    }, 350);
   });
 }
 
 function fillCode(code, inputs) {
-  if (!inputs?.length) return;
+  if (!inputs?.length || !code) return false;
   const boxes = inputs.length >= 4 ? inputs : [inputs[0]];
   if (boxes.length >= 4) {
-    code.split('').forEach((char, index) => {
+    const digits = String(code).replace(/\D/g, '');
+    digits.split('').forEach((char, index) => {
       if (boxes[index]) typeVal(boxes[index], char);
     });
   } else {
-    typeVal(boxes[0], code);
+    typeVal(boxes[0], String(code));
   }
+  return true;
 }
 
 async function checkPageState() {
+  // Nested frames only observe mutations for parent; never drive login automation.
+  if (!isTopFrame()) return;
+
   const { sw_running, sw_paused, execMode: storedMode } = await chrome.storage.local.get(['sw_running', 'sw_paused', 'execMode']);
   // Paused or stopped: do not drive the page.
   if (!sw_running || sw_paused) return;
   if (storedMode) execMode = storedMode;
 
+  // Hard error / blank-stuck first (auto + step-by-step).
+  if (detectAndRecoverErrorPage()) return;
+
   const page = classifyPage();
   notePageChange(page.kind);
+
+  if (page.kind === 'page-error') {
+    detectAndRecoverErrorPage();
+    return;
+  }
 
   // Always auto-dismiss passkey / keep-signed-in, even in step-by-step mode.
   if (page.kind === 'passkey') {
@@ -668,6 +1019,12 @@ async function checkPageState() {
     return;
   }
 
+  // Channel picker → click Next so Microsoft sends the code (both modes).
+  if (page.kind === 'code-send-method') {
+    handleCodeSendMethod(execMode === 'auto' ? '自动' : '检测', page.nextBtn);
+    return;
+  }
+
   // Backup email verified (expired-code banner) → always reopen auth.
   if (page.kind === 'code-expired') {
     reopenAuthAfterBackupVerified(execMode === 'auto' ? '自动' : '检测');
@@ -690,6 +1047,8 @@ async function checkPageState() {
         sendLog('📌 检测到登录页面，请点击“步骤 2”填写账号密码', 'info');
       } else if (page.kind === 'code') {
         sendLog('📌 检测到验证码页面，请点击“步骤 3”获取并填写验证码', 'info');
+      } else if (page.kind === 'code-send-method') {
+        sendLog('📌 检测到代码发送方式页，请点击“步骤 3”点下一步', 'info');
       } else if (page.kind === 'proof-resend') {
         sendLog('📌 检测到备用邮箱再验证页面，请点击“步骤 3”填写并发送验证码', 'info');
       } else if (page.kind === 'proof-initial') {
@@ -711,6 +1070,7 @@ async function checkPageState() {
     case 'proof-initial':
     case 'proof-resend':
     case 'code':
+    case 'code-send-method':
     case 'consent':
       executeStep3();
       break;

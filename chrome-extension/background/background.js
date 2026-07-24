@@ -19,6 +19,55 @@ let stateDirty = false;
 // Finished accounts since last Microsoft session cleanup (normal/incognito each have own SW).
 let accountsSinceCleanup = 0;
 const CLEANUP_EVERY_N = 5;
+// Last auth URL opened for current account (used to recover from SSL/blank error pages).
+let lastAuthUrl = null;
+// Rate-limit SSL/blank-page auto-recovery per account email.
+const pageRecoverAttempts = new Map(); // email -> { count, lastAt }
+// Full task re-runs after hard SSL / recover budget (transient proxy glitches).
+const pageFullRerunCount = new Map(); // email -> number of full re-runs already used
+const PAGE_RECOVER_MAX = 2; // soft blank only — limited blank hops, then full re-run
+const PAGE_FULL_RERUN_MAX = 1; // soft blank exhausted: re-run whole account once, then skip
+// Hard SSL/proxy errors rarely heal by reopening the same auth page — skip immediately.
+const PAGE_RECOVER_COOLDOWN_MS = 2500;
+// Blank/error must stay continuous this long before SW recovers (nav white-flash is shorter).
+const PAGE_ANOMALY_SUSTAIN_MS = 3000;
+// Soft blank only when automation has no progress this long (login transitions need more than 3s).
+const PAGE_STUCK_MS = 10000;
+// After a top-frame navigation starts, ignore soft-blank for this long (email→password hop).
+const PAGE_NAV_GRACE_MS = 6000;
+// Pending anomaly watches: tabId -> { firstSeenAt, reason, url, lastLogAt, hard, timer }
+const pageAnomalyWatch = new Map();
+// last progress timestamp (account actions / healthy page) — soft blank needs stuck + sustain
+let lastProgressAt = Date.now();
+// Last top-frame navigation start — soft blank must wait past grace after this.
+let lastNavAt = 0;
+// Suppress re-detect while a recovery navigation is in flight.
+let pageRecoverInFlightUntil = 0;
+
+function markProgress() {
+  lastProgressAt = Date.now();
+}
+
+function isTaskStuck() {
+  return Date.now() - lastProgressAt >= PAGE_STUCK_MS;
+}
+
+function isInNavGrace() {
+  return lastNavAt > 0 && Date.now() - lastNavAt < PAGE_NAV_GRACE_MS;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+// Slightly slower inter-account / post-success pacing (anti risk-control).
+const ADVANCE_DELAY_MS = 2800;
+const ADVANCE_DELAY_JITTER_MS = 1200;
+const STEP4_AUTO_DELAY_MS = 900;
+const AUTH_UI_READY_MS = 2200;
+
+function humanDelay(baseMs, jitterMs = 400) {
+  return baseMs + Math.floor(Math.random() * Math.max(0, jitterMs));
+}
 
 // Origins / cookie domains used by Microsoft login & Outlook (clear only these).
 const MS_BROWSING_ORIGINS = [
@@ -242,6 +291,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         );
         await executeStep1();
         break;
+      case 'pageErrorRecover':
+        // Content already sustained anomaly ≥3s before sending; recover immediately.
+        await recoverFromPageError(msg.reason || 'content-detect', {
+          tabId: sender?.tab?.id,
+          url: msg.url || sender?.tab?.url || ''
+        });
+        break;
+      case 'progressHeartbeat':
+        // Content marks automation progress / healthy login UI → cancel soft blank.
+        markProgress();
+        if (sender?.tab?.id != null) clearPageAnomalyWatch(sender.tab.id);
+        break;
       case 'executeStep':
         if (msg.step === 1) {
           await executeStep1();
@@ -269,6 +330,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(currentAccount);
         break;
       case 'fetchVerificationCode':
+        markProgress();
         const code = await fetchCodeFromTempEmail();
         sendResponse(code);
         break;
@@ -321,6 +383,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // 命中后写回当前账号，确保后续接码 API 用对地址
           if (matched && currentAccount) {
             currentAccount.backupEmail = matched;
+            markProgress();
             await saveState();
             sendLog(`[匹配] 已将当前账号备用邮箱更新为 ${matched}`, 'success');
           } else if (!matched) {
@@ -345,8 +408,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   loadState().then(async () => {
     if (isPaused || !isRunning) return;
+    if (tabId !== currentTabId || !currentAccount) return;
+
+    // Navigation start / URL change = live hop (email→password etc.). Cancel soft blank.
+    if (changeInfo.status === 'loading' || changeInfo.url) {
+      lastNavAt = Date.now();
+      markProgress();
+      clearPageAnomalyWatch(tabId);
+    }
+
+    // Detect SSL / network error interstitials after load completes (or when title changes).
+    if (changeInfo.status === 'complete' || changeInfo.title) {
+      maybeProbeErrorPage(
+        tabId,
+        tab?.url || changeInfo.url || '',
+        tab?.title || changeInfo.title || '',
+        changeInfo.status === 'complete'
+      ).catch(() => {});
+    }
+
     const url = changeInfo.url || tab.url;
-    if (!url || !url.includes('nativeclient') || tabId !== currentTabId || !currentAccount) return;
+    if (!url || !url.includes('nativeclient')) return;
 
     try {
       const u = new URL(url);
@@ -392,7 +474,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
               if (/null|undefined/i.test(e?.message || '') && /email/i.test(e?.message || '')) return;
               sendLog(`自动换取令牌失败: ${e.message}`, 'error');
             });
-          }, 400);
+          }, humanDelay(STEP4_AUTO_DELAY_MS, 400));
         } else {
           sendLog(`[${currentAccount.email}] ✅ 授权码已就绪，请点击“步骤 4”获取令牌`, 'success');
         }
@@ -400,6 +482,400 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     } catch (_) {}
   });
 });
+
+// Top-frame navigation committed → live hop; soft blank must wait out grace.
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId !== 0) return;
+  if (details.tabId !== currentTabId) return;
+  lastNavAt = Date.now();
+  markProgress();
+  clearPageAnomalyWatch(details.tabId);
+});
+
+// Network / SSL failures (content scripts often cannot run on chrome-error pages).
+// Only recover after the error has stayed continuous for PAGE_ANOMALY_SUSTAIN_MS.
+chrome.webNavigation.onErrorOccurred.addListener((details) => {
+  if (details.frameId !== 0) return;
+  loadState().then(async () => {
+    if (isPaused || !isRunning) return;
+    if (details.tabId !== currentTabId || !currentAccount) return;
+    const err = String(details.error || '');
+    // Ignore aborted/cancelled navigations (we often cancel when switching accounts).
+    if (/ERR_ABORTED/i.test(err)) return;
+    if (!isLikelyPageError(err, details.url || '', '')) return;
+    await notePageAnomaly(err || 'webNavigation-error', {
+      tabId: details.tabId,
+      url: details.url || '',
+      hard: true
+    });
+  }).catch(() => {});
+});
+
+function isLikelyPageError(errorText, url, title) {
+  const blob = `${errorText || ''} ${url || ''} ${title || ''}`.toLowerCase();
+  if (/chrome-error:\/\/|chromewebdata/i.test(blob)) return true;
+  if (/err_ssl|err_connection|err_timed_out|err_name_not_resolved|err_network|err_tunnel|err_proxy|err_cert|err_empty_response|err_connection_reset|err_connection_closed|err_connection_refused|err_internet_disconnected|err_address_unreachable|err_ssl_protocol_error|err_ssl_version|err_bad_ssl|err_http2|dns_probe|net::err_/i.test(blob)) return true;
+  if (/无法提供安全连接|此网站无法提供安全连接|安全连接|响应无效|无法访问此网站|网页无法打开|连接已重置|连接超时|暂时无法访问|没有互联网连接|privacy error|your connection is not private|this site can.?t (be reached|provide a secure connection)|err_ssl_protocol_error/i.test(blob)) return true;
+  return false;
+}
+
+function isMsAuthRelatedUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    const h = (u.hostname || '').toLowerCase();
+    return (
+      h.includes('login.live.com') ||
+      h.includes('login.microsoftonline.com') ||
+      h.includes('account.live.com') ||
+      h.includes('account.microsoft.com') ||
+      h.includes('microsoft.com') ||
+      h.includes('live.com') ||
+      h.includes('office.com') ||
+      h.includes('outlook.') ||
+      url.startsWith('chrome-error://')
+    );
+  } catch (_) {
+    return /login\.live|microsoftonline|chrome-error/i.test(String(url));
+  }
+}
+
+/**
+ * Start / refresh anomaly sustain watch.
+ * hard=true  → SSL/network error: recover after continuous ≥3s
+ * hard=false → soft blank: only if task stuck ≥ PAGE_STUCK_MS, then continuous ≥3s
+ */
+async function notePageAnomaly(reason, { tabId, url, hard = true } = {}) {
+  if (isPaused || !isRunning || !currentAccount) return;
+  if (tabId != null && currentTabId != null && tabId !== currentTabId) return;
+  // Don't interrupt a successful token exchange.
+  if (currentAccount.isFetchingToken || step4Lock || currentAccount.pendingAuthCode) return;
+  // Ignore noise while recovery navigation is still settling.
+  if (Date.now() < pageRecoverInFlightUntil) return;
+
+  // Soft blank: only when task stuck AND not mid email→password (etc.) navigation.
+  if (!hard) {
+    if (!isTaskStuck() || isInNavGrace()) {
+      clearPageAnomalyWatch(tabId != null ? tabId : currentTabId);
+      return;
+    }
+  }
+
+  const tid = tabId != null ? tabId : currentTabId;
+  if (tid == null) return;
+
+  const now = Date.now();
+  let watch = pageAnomalyWatch.get(tid);
+  if (!watch) {
+    watch = { firstSeenAt: now, reason, url: url || '', lastLogAt: 0, hard: !!hard, timer: null };
+    pageAnomalyWatch.set(tid, watch);
+  } else {
+    watch.reason = reason || watch.reason;
+    if (url) watch.url = url;
+    // Once hard error is seen, keep hard.
+    if (hard) watch.hard = true;
+  }
+
+  const sustained = now - watch.firstSeenAt;
+  if (sustained < PAGE_ANOMALY_SUSTAIN_MS) {
+    if (now - watch.lastLogAt > 2000) {
+      watch.lastLogAt = now;
+      const email = currentAccount.email || 'unknown';
+      sendLog(
+        watch.hard
+          ? `[${email}] 检测到错误页，持续观察中 (${Math.round(sustained / 100) / 10}s / ${PAGE_ANOMALY_SUSTAIN_MS / 1000}s)…`
+          : `[${email}] 任务卡住且页面异常（非正常登录页），持续观察中 (${Math.round(sustained / 100) / 10}s / ${PAGE_ANOMALY_SUSTAIN_MS / 1000}s)…`,
+        'warning'
+      );
+    }
+    // Re-arm: webNavigation / onUpdated may not fire again while stuck on error page.
+    if (watch.timer) clearTimeout(watch.timer);
+    const remain = Math.max(200, PAGE_ANOMALY_SUSTAIN_MS - sustained + 50);
+    watch.timer = setTimeout(() => {
+      const w = pageAnomalyWatch.get(tid);
+      if (!w) return;
+      notePageAnomaly(w.reason, { tabId: tid, url: w.url, hard: w.hard }).catch(() => {});
+    }, remain);
+    return;
+  }
+
+  if (watch.timer) {
+    clearTimeout(watch.timer);
+    watch.timer = null;
+  }
+  pageAnomalyWatch.delete(tid);
+  await recoverFromPageError(reason || watch.reason, { tabId: tid, url: url || watch.url });
+}
+
+function clearPageAnomalyWatch(tabId) {
+  if (tabId == null) return;
+  const w = pageAnomalyWatch.get(tabId);
+  if (w?.timer) clearTimeout(w.timer);
+  pageAnomalyWatch.delete(tabId);
+}
+
+async function maybeProbeErrorPage(tabId, url, title, statusComplete = false) {
+  if (isPaused || !isRunning || tabId !== currentTabId || !currentAccount) return;
+  if (title && isLikelyPageError('', url, title)) {
+    await notePageAnomaly(`title:${title}`, { tabId, url, hard: true });
+    return;
+  }
+  // Only probe MS / error-related tabs to avoid random page noise.
+  if (url && !isMsAuthRelatedUrl(url) && !isLikelyPageError('', url, title || '')) return;
+
+  let probe = null;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      func: () => {
+        try {
+          const body = (document.body?.innerText || document.documentElement?.innerText || '').slice(0, 2500);
+          const html = (document.documentElement?.outerHTML || '').slice(0, 2000);
+          const href = location.href || '';
+          // Any interactive control means a normal login step (not blank).
+          const hasUi = !!(
+            document.querySelector(
+              'input[name="loginfmt"], input[name="passwd"], input[type="password"], input[type="email"], ' +
+              '#i0116, #i0118, #idSIButton9, #otc, input[name="otc"], #proofConfirmationText, ' +
+              'input[name="ProofConfirmation"], input[name="EmailAddress"], input[type="text"], ' +
+              'textarea, button, input[type="submit"], input[type="button"], [role="button"], ' +
+              '#msaTile, #idBtn_Back, #idBtn_Accept, form'
+            )
+          );
+          const ready = document.readyState || '';
+          return { body, html, href, title: document.title || '', hasUi, ready };
+        } catch (e) {
+          return { body: '', html: '', href: location?.href || '', title: document?.title || '', hasUi: false, ready: '', err: String(e) };
+        }
+      }
+    });
+    probe = results?.[0]?.result || null;
+  } catch (_) {
+    // executeScript often fails on chrome-error:// pages — treat as hard recoverable error.
+    if (isLikelyPageError('', url, title) || /^chrome-error:/i.test(url || '')) {
+      await notePageAnomaly('probe-inject-failed', { tabId, url, hard: true });
+    }
+    return;
+  }
+
+  if (!probe) return;
+  const text = `${probe.title || ''} ${probe.body || ''} ${probe.html || ''} ${probe.href || ''}`;
+  if (!isLikelyPageError(text, probe.href || url, probe.title || title)) {
+    // Soft blank: complete load + past nav grace + MS host + no UI + almost no text + task stuck.
+    const bare = String(probe.body || '').replace(/\s+/g, ' ').trim();
+    const hostOk = isMsAuthRelatedUrl(probe.href || url);
+    const hasLoginUi = !!probe.hasUi ||
+      /loginfmt|passwd|type="password"|i0116|i0118|idSIButton9|otc|proof|验证码|sign in|登录|输入你的密码|输入密码|password|邮箱|email|验证你的|帐户|账户|keep me signed|保持登录/i.test(
+        `${probe.html || ''} ${probe.body || ''} ${probe.title || ''}`
+      );
+    // Any recognizable login UI or meaningful copy = healthy (cancel blank watch).
+    if (hasLoginUi || bare.length >= 40) {
+      clearPageAnomalyWatch(tabId);
+      markProgress();
+      return;
+    }
+    // Mid-navigation or still loading — never soft-blank.
+    if (!statusComplete || isInNavGrace() || (probe.ready && probe.ready !== 'complete')) {
+      clearPageAnomalyWatch(tabId);
+      return;
+    }
+    if (hostOk && bare.length < 40 && isTaskStuck()) {
+      await notePageAnomaly('blank-stuck', { tabId, url: probe.href || url, hard: false });
+      return;
+    }
+    clearPageAnomalyWatch(tabId);
+    return;
+  }
+  await notePageAnomaly(probe.title || 'content-error-page', { tabId, url: probe.href || url, hard: true });
+}
+
+/** Hard SSL/network errors should re-run the whole account, not blank-hop. */
+function isHardNetworkError(reason) {
+  const s = String(reason || '');
+  return /ERR_SSL|ERR_CONNECTION|ERR_TIMED_OUT|ERR_NAME_NOT|ERR_NETWORK|ERR_TUNNEL|ERR_PROXY|ERR_CERT|ERR_EMPTY|ERR_INTERNET|ERR_ADDRESS|ERR_HTTP2|chrome-error|无法提供安全连接|安全连接|响应无效|title:.*安全|probe-inject-failed|content-error-page|webNavigation-error/i.test(s);
+}
+
+/**
+ * Skip current account after a hard SSL/proxy error (no re-open auth page).
+ */
+async function skipAccountOnHardError(reason) {
+  if (!currentAccount) return;
+  const email = currentAccount.email || 'unknown';
+  const shortReason = String(reason || 'unknown').slice(0, 100);
+  const password = currentAccount.password;
+  const clientId = currentAccount.clientId;
+  const backupEmail = currentAccount.backupEmail;
+
+  clearPageAnomalyWatch(currentTabId);
+  pageRecoverInFlightUntil = Date.now() + 8000;
+  step4Lock = false;
+  lastAuthUrl = null;
+  pageRecoverAttempts.delete(email);
+  pageFullRerunCount.delete(email);
+
+  if (currentTabId) {
+    const tabToClose = currentTabId;
+    currentTabId = null;
+    try { await chrome.tabs.remove(tabToClose); } catch (_) {}
+  }
+
+  sendLog(
+    `[${email}] ⚠️ 硬网络/SSL 错误，直接跳过该账号（${shortReason}；请检查代理/网络）`,
+    'error'
+  );
+  await finishAccount({
+    success: false,
+    email,
+    password,
+    clientId,
+    backupEmail,
+    error: `页面异常(硬错误跳过): ${shortReason}`
+  });
+}
+
+/**
+ * Re-run current account from step 1, or skip if already re-ran.
+ * Used for soft blank / stuck pages that may recover after a clean reopen.
+ */
+async function fullRerunCurrentAccount(reason) {
+  if (!currentAccount) return;
+  const email = currentAccount.email || 'unknown';
+  const shortReason = String(reason || 'unknown').slice(0, 100);
+  const used = pageFullRerunCount.get(email) || 0;
+
+  clearPageAnomalyWatch(currentTabId);
+  pageRecoverInFlightUntil = Date.now() + 8000;
+  step4Lock = false;
+  lastAuthUrl = null;
+  pageRecoverAttempts.delete(email);
+
+  // Close broken error tab first.
+  if (currentTabId) {
+    const tabToClose = currentTabId;
+    currentTabId = null;
+    try { await chrome.tabs.remove(tabToClose); } catch (_) {}
+  }
+
+  if (used < PAGE_FULL_RERUN_MAX) {
+    pageFullRerunCount.set(email, used + 1);
+
+    const requeue = {
+      email: currentAccount.email,
+      password: currentAccount.password,
+      backupEmail: currentAccount.backupEmail || undefined
+    };
+    if (!(accountsQueue[0] && accountsQueue[0].email === requeue.email)) {
+      accountsQueue.unshift(requeue);
+    }
+    currentAccount = null;
+    markDirty();
+    await saveState();
+
+    try {
+      await clearMicrosoftSession({ quiet: true, closeTab: false, dropPkce: true });
+    } catch (_) {}
+
+    sendLog(
+      `[${email}] 检测到页面异常（${shortReason}），整任务从步骤1重跑 (${used + 1}/${PAGE_FULL_RERUN_MAX})…`,
+      'warning'
+    );
+    // Reset step UI so side panel doesn't stay on stale 3/4 completed.
+    broadcastStep(1, 'pending', email);
+    broadcastStep(2, 'pending', email);
+    broadcastStep(3, 'pending', email);
+    broadcastStep(4, 'pending', email);
+
+    isRunning = true;
+    isPaused = false;
+    scheduleAdvance(humanDelay(2000, 600));
+    return;
+  }
+
+  sendLog(
+    `[${email}] ⚠️ 整任务重跑后仍异常，跳过该账号（${shortReason}；请检查代理/网络）`,
+    'error'
+  );
+  await finishAccount({
+    success: false,
+    email,
+    password: currentAccount.password,
+    clientId: currentAccount.clientId,
+    backupEmail: currentAccount.backupEmail,
+    error: `页面异常(已重跑): ${shortReason}`
+  });
+}
+
+/**
+ * Recover from SSL / blank / network error pages.
+ * Hard SSL/proxy → skip account immediately (reopening auth rarely helps).
+ * Soft blank → at most PAGE_RECOVER_MAX blank hops, then full re-run once.
+ */
+async function recoverFromPageError(reason, { tabId, url } = {}) {
+  if (isPaused || !isRunning || !currentAccount) return;
+  if (tabId != null && currentTabId != null && tabId !== currentTabId) return;
+
+  const email = currentAccount.email || 'unknown';
+  if (currentAccount.isFetchingToken || step4Lock || currentAccount.pendingAuthCode) return;
+
+  const now = Date.now();
+  if (now < pageRecoverInFlightUntil) return;
+
+  const prev = pageRecoverAttempts.get(email) || { count: 0, lastAt: 0 };
+  if (now - prev.lastAt < PAGE_RECOVER_COOLDOWN_MS) return;
+
+  const hard = isHardNetworkError(reason);
+  clearPageAnomalyWatch(currentTabId || tabId);
+  markProgress();
+
+  // Hard SSL/proxy: skip immediately — reopening auth on same network almost always fails again.
+  if (hard) {
+    pageRecoverAttempts.set(email, { count: PAGE_RECOVER_MAX + 1, lastAt: now });
+    pageRecoverInFlightUntil = Date.now() + 8000;
+    sendLog(`[${email}] 硬错误页，直接跳过: ${String(reason || '').slice(0, 100)}`, 'warning');
+    await skipAccountOnHardError(reason);
+    return;
+  }
+
+  // Soft blank: limited in-page recover, then full re-run.
+  if (prev.count >= PAGE_RECOVER_MAX) {
+    if (prev.count === PAGE_RECOVER_MAX) {
+      pageRecoverAttempts.set(email, { count: prev.count + 1, lastAt: now });
+      await fullRerunCurrentAccount(reason || 'blank-stuck');
+    }
+    return;
+  }
+
+  const attempt = prev.count + 1;
+  pageRecoverAttempts.set(email, { count: attempt, lastAt: now });
+  const shortReason = String(reason || 'unknown').slice(0, 120);
+  sendLog(`[${email}] 疑似白屏，尝试页内恢复 (${attempt}/${PAGE_RECOVER_MAX}): ${shortReason}`, 'warning');
+  pageRecoverInFlightUntil = Date.now() + 4500;
+
+  const target = lastAuthUrl;
+  const tid = currentTabId || tabId;
+
+  try {
+    if (tid != null && target) {
+      await chrome.tabs.get(tid);
+      await chrome.tabs.update(tid, { url: 'about:blank', active: true });
+      await sleep(humanDelay(350, 150));
+      await chrome.tabs.update(tid, { url: target, active: true });
+      sendLog(`[${email}] 已强制重新打开授权页（跳过表单重提）`, 'info');
+      pageRecoverInFlightUntil = Date.now() + 4000;
+      return;
+    }
+  } catch (_) {
+    currentTabId = null;
+  }
+
+  try {
+    await executeStep1();
+    pageRecoverInFlightUntil = Date.now() + 4000;
+  } catch (e) {
+    sendLog(`[${email}] 页内恢复失败，改为整任务重跑: ${e.message || e}`, 'warning');
+    await fullRerunCurrentAccount(e.message || reason);
+  }
+}
 
 // Step 1: open / reopen Microsoft auth page for current account
 async function executeStep1() {
@@ -442,11 +918,13 @@ async function executeStep1() {
 
   sendLog(`[${currentAccount.email}] 步骤 1/4：正在打开授权页面...`, 'info');
   broadcastStep(1, 'active', currentAccount.email);
+  markProgress();
 
   const codeVerifier = generateCodeVerifier();
   const codeChallenge = await generateCodeChallenge(codeVerifier);
   const state = getRandomState();
   const authUrl = buildAuthUrl(clientId, codeChallenge, state);
+  lastAuthUrl = authUrl;
   const key = currentAccount.email + '_' + clientId;
   await chrome.storage.local.set({ [`pkce_${key}`]: { codeVerifier, state } });
   await saveState();
@@ -476,7 +954,7 @@ async function executeStep1() {
     } else {
       sendLog(`[${emailSnapshot}] 📝 授权页已打开，请点击“步骤 2”填写账号密码`, 'warning');
     }
-  }, 1500);
+  }, humanDelay(AUTH_UI_READY_MS, 500));
 }
 
 // Step 4: exchange authorization code for refresh token
@@ -615,6 +1093,14 @@ async function startProcess(accounts) {
   claimedAuthCodes.clear();
   backupEmailCursor = 0;
   accountsSinceCleanup = 0;
+  lastAuthUrl = null;
+  pageRecoverAttempts.clear();
+  pageFullRerunCount.clear();
+  for (const w of pageAnomalyWatch.values()) {
+    if (w?.timer) clearTimeout(w.timer);
+  }
+  pageAnomalyWatch.clear();
+  markProgress();
   markDirty();
   if (currentTabId) { chrome.tabs.remove(currentTabId).catch(() => {}); currentTabId = null; }
 
@@ -691,7 +1177,7 @@ async function resumeProcess(mode) {
     // If auth code already pending, finish step 4; otherwise reopen login.
     if (currentAccount.pendingAuthCode) {
       if (currentMode === 'auto') {
-        setTimeout(() => { executeStep4().catch(() => {}); }, 300);
+        setTimeout(() => { executeStep4().catch(() => {}); }, humanDelay(STEP4_AUTO_DELAY_MS, 400));
       } else {
         sendLog('授权码仍在，请点击“步骤 4”获取令牌', 'warning');
         broadcastStep(4, 'active', currentAccount.email);
@@ -758,9 +1244,13 @@ async function processNext() {
   // Re-load queue/current only if another path mutated storage mid-await — but keep our shift.
   // Prefer memory for queue/current; only merge settings from live.
   settings = { ...settings, ...live };
-  const backupEmail = resolveBackupEmail(settings);
+  // Prefer backup already bound to this account (e.g. full-task re-run); else pick next.
+  const backupEmail = account.backupEmail || resolveBackupEmail(settings);
   currentAccount = { ...account, clientId, backupEmail };
   step4Lock = false;
+  markProgress();
+  pageRecoverInFlightUntil = 0;
+  clearPageAnomalyWatch(currentTabId);
   if (!backupEmail) {
     sendLog(`[${account.email}] ⚠️ 未配置备用邮箱：固定模式请填邮箱列表，随机模式请填域名`, 'warning');
   } else if (settings.backupEmailMode === 'random') {
@@ -775,6 +1265,9 @@ async function processNext() {
   const codeChallenge = await generateCodeChallenge(codeVerifier);
   const state = getRandomState();
   const authUrl = buildAuthUrl(clientId, codeChallenge, state);
+  lastAuthUrl = authUrl;
+  // Fresh account → allow a new recovery budget.
+  pageRecoverAttempts.delete(account.email);
 
   const key = account.email + '_' + clientId;
   await chrome.storage.local.set({ [`pkce_${key}`]: { codeVerifier, state } });
@@ -804,7 +1297,7 @@ async function processNext() {
     } else {
       sendLog(`[${account.email}] 📝 逐步骤模式：点击"步骤 2"圆圈开始自动登录`, 'warning');
     }
-  }, 3000);
+  }, humanDelay(AUTH_UI_READY_MS + 500, 600));
 }
 
 // ============== Microsoft / Outlook session cleanup ==============
@@ -822,12 +1315,18 @@ function isMsCookieDomain(domain) {
   return MS_COOKIE_DOMAIN_SUFFIXES.some((s) => d === s || d.endsWith('.' + s));
 }
 
-async function clearOutlookSessionCache(reason = '') {
+/**
+ * Clear MS cookies / site data.
+ * closeTab=false keeps the current auth tab (used during SSL recovery mid-account).
+ * dropPkce=false keeps PKCE so the same authorize URL can still exchange tokens.
+ */
+async function clearMicrosoftSession({ quiet = false, closeTab = false, dropPkce = false } = {}) {
   const label = profileLabel();
-  sendLog(`🧹 [${label}] 清理 Outlook/Microsoft 登录缓存${reason ? `（${reason}）` : ''}...`, 'warning');
+  if (!quiet) {
+    sendLog(`🧹 [${label}] 清理 Outlook/Microsoft 登录缓存...`, 'warning');
+  }
 
-  // Close auth tab first so the page cannot rewrite cookies during clear.
-  if (currentTabId) {
+  if (closeTab && currentTabId) {
     const tabToClose = currentTabId;
     currentTabId = null;
     try { await chrome.tabs.remove(tabToClose); } catch (_) {}
@@ -847,7 +1346,7 @@ async function clearOutlookSessionCache(reason = '') {
     }));
     cookieCount = targets.length;
   } catch (e) {
-    sendLog(`[${label}] Cookie 清理失败: ${e.message || e}`, 'warning');
+    if (!quiet) sendLog(`[${label}] Cookie 清理失败: ${e.message || e}`, 'warning');
   }
 
   try {
@@ -864,16 +1363,24 @@ async function clearOutlookSessionCache(reason = '') {
       }
     );
   } catch (e) {
-    sendLog(`[${label}] browsingData 清理失败: ${e.message || e}`, 'warning');
+    if (!quiet) sendLog(`[${label}] browsingData 清理失败: ${e.message || e}`, 'warning');
   }
 
-  // Drop leftover PKCE blobs so next account always starts clean.
-  try {
-    const all = await chrome.storage.local.get(null);
-    const pkceKeys = Object.keys(all || {}).filter((k) => k.startsWith('pkce_'));
-    if (pkceKeys.length) await chrome.storage.local.remove(pkceKeys);
-  } catch (_) {}
+  if (dropPkce) {
+    try {
+      const all = await chrome.storage.local.get(null);
+      const pkceKeys = Object.keys(all || {}).filter((k) => k.startsWith('pkce_'));
+      if (pkceKeys.length) await chrome.storage.local.remove(pkceKeys);
+    } catch (_) {}
+  }
 
+  return cookieCount;
+}
+
+async function clearOutlookSessionCache(reason = '') {
+  const label = profileLabel();
+  sendLog(`🧹 [${label}] 清理 Outlook/Microsoft 登录缓存${reason ? `（${reason}）` : ''}...`, 'warning');
+  const cookieCount = await clearMicrosoftSession({ quiet: true, closeTab: true, dropPkce: true });
   accountsSinceCleanup = 0;
   markDirty();
   await saveState();
@@ -881,15 +1388,19 @@ async function clearOutlookSessionCache(reason = '') {
 }
 
 /** After finishing N accounts, clear MS session before opening the next auth page. */
-async function scheduleAdvance(delayMs = 1500) {
+async function scheduleAdvance(delayMs = ADVANCE_DELAY_MS) {
   if (isPaused || !isRunning) return;
   const needClean = accountsSinceCleanup >= CLEANUP_EVERY_N;
-  const wait = needClean ? Math.max(delayMs, 600) : delayMs;
+  const wait = needClean
+    ? Math.max(delayMs, humanDelay(1200, 400))
+    : humanDelay(delayMs, ADVANCE_DELAY_JITTER_MS);
   setTimeout(async () => {
     if (isPaused || !isRunning) return;
     try {
       if (accountsSinceCleanup >= CLEANUP_EVERY_N) {
         await clearOutlookSessionCache(`已处理 ${accountsSinceCleanup} 个账号`);
+        // Extra pause after cache clear so next login looks less bot-like.
+        await new Promise((r) => setTimeout(r, humanDelay(800, 600)));
       }
     } catch (e) {
       sendLog(`缓存清理异常: ${e.message || e}`, 'warning');
@@ -952,7 +1463,7 @@ async function skipToNextAccount(reason = '用户手动切换到下一个账号'
   markDirty();
   await saveState();
   broadcastToPopup({ type: 'resumed', account: null, remaining: accountsQueue.length });
-  scheduleAdvance(400);
+  scheduleAdvance(humanDelay(900, 400));
 }
 
 // ============== Finish Current Account ==============
@@ -966,7 +1477,7 @@ async function finishAccount(result) {
     // Already finished this exact outcome — still try to advance if queue remains.
     if (results.some((r) => r.email === result.email && r.token === result.token && r.success === result.success)) {
       if (!isPaused && isRunning && !currentAccount) {
-        scheduleAdvance(500);
+        scheduleAdvance(humanDelay(1200, 400));
       }
       return;
     }
@@ -1011,6 +1522,8 @@ async function finishAccount(result) {
 
   if (result.success) {
     sendLog(`[${result.email}] ✅ 获取 Refresh Token 成功`, 'success');
+    pageFullRerunCount.delete(result.email);
+    pageRecoverAttempts.delete(result.email);
   } else {
     sendLog(`[${result.email}] ❌ 失败: ${result.error}`, 'error');
   }
@@ -1020,7 +1533,7 @@ async function finishAccount(result) {
   if (isPaused) return;
   // Always advance after a terminal finish when still running.
   if (shouldAdvance || isRunning) {
-    scheduleAdvance(1500);
+    scheduleAdvance(ADVANCE_DELAY_MS);
   }
 }
 
@@ -1116,6 +1629,9 @@ async function fetchCodeFromTempEmail() {
   }
 
   sendLog(`正在查询验证码 (API: ${apiUrl}，邮箱: ${searchAddress || '未指定'})...`, 'info');
+  // Wait for the new mail to arrive — immediate poll often grabs a previous code.
+  sendLog('等待 3 秒后再取码（避免取到上一次的旧验证码）...', 'info');
+  await new Promise(r => setTimeout(r, 3000));
 
   for (let i = 0; i < 20; i++) {
     await loadState();

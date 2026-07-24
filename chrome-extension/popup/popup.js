@@ -16,6 +16,7 @@ document.addEventListener('DOMContentLoaded', () => {
     clearLogBtn: $('clearLogBtn'),
     resultsOutput: $('resultsOutput'),
     resultCount: $('resultCount'),
+    resultSortSelect: $('resultSortSelect'),
     copyResultsBtn: $('copyResultsBtn'),
     exportResultsBtn: $('exportResultsBtn'),
     currentAccountText: $('currentAccountText'),
@@ -35,6 +36,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const conns = [null, null, els.conn1, els.conn2, els.conn3];
   let totalAccounts = 0;
   let uiState = 'idle'; // idle | running | paused
+  // Ordered result records for sort (execution order preserved via seq).
+  let resultRecords = [];
+  let resultSeq = 0;
+  let resultSortMode = 'order'; // 'order' | 'status'
 
   // ============== Mode switching ==============
   function setMode(mode) {
@@ -51,12 +56,16 @@ document.addEventListener('DOMContentLoaded', () => {
   // Load saved mode / queue state (results stay in the panel only; no auto local files)
   chrome.storage.local.get([
     'savedAccounts', 'sw_running', 'sw_paused', 'execMode',
-    'sw_current', 'sw_queue'
+    'sw_current', 'sw_queue', 'resultSortMode'
   ], (r) => {
     if (r.savedAccounts) els.accountInput.value = r.savedAccounts;
     if (r.execMode) setMode(r.execMode);
+    if (r.resultSortMode === 'status' || r.resultSortMode === 'order') {
+      resultSortMode = r.resultSortMode;
+      if (els.resultSortSelect) els.resultSortSelect.value = resultSortMode;
+    }
     updateCount();
-    
+
     // 强制清理残留状态：如果后台脚本并没有真的在运行（或者重启了浏览器），不能仅仅因为 sw_current 残留就变为 paused
     // 我们必须信任 sw_running 或 sw_paused，如果两者都不为 true，强制进入 idle
     if (r.sw_running) {
@@ -156,6 +165,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setUiState('running');
     resetSteps();
     setStep(1, 'active');
+    resultRecords = [];
+    resultSeq = 0;
     els.resultsOutput.value = '';
     els.resultCount.textContent = '0';
     clearLog();
@@ -256,26 +267,74 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  function appendResult(r) {
-    const lines = els.resultsOutput.value.split('\n').filter((l) => l.trim());
-    if (!r.success) {
-      const hasSuccess = lines.some((l) => l.startsWith(r.email + '----') && !l.includes('----FAILED----'));
-      if (hasSuccess) return;
+  function formatResultLine(rec) {
+    if (rec.success) {
+      return `${rec.email}----${rec.password}----${rec.clientId || '内置ID'}----${rec.token}`;
+    }
+    return `${rec.email}----${rec.password}----FAILED----${rec.error || ''}`;
+  }
+
+  function getSortedResultRecords() {
+    const list = resultRecords.slice();
+    if (resultSortMode === 'status') {
+      // Success group first, then failed; keep execution order within each group.
+      list.sort((a, b) => {
+        if (a.success !== b.success) return a.success ? -1 : 1;
+        return a.seq - b.seq;
+      });
     } else {
-      const filtered = lines.filter((l) => !(l.startsWith(r.email + '----') && l.includes('----FAILED----')));
-      const withoutDup = filtered.filter((l) => !l.startsWith(r.email + '----'));
-      els.resultsOutput.value = withoutDup.join('\n');
+      list.sort((a, b) => a.seq - b.seq);
+    }
+    return list;
+  }
+
+  function renderResults() {
+    const sorted = getSortedResultRecords();
+    els.resultsOutput.value = sorted.map(formatResultLine).join('\n');
+    els.resultCount.textContent = String(sorted.length);
+    if (totalAccounts) els.progressText.textContent = `${sorted.length}/${totalAccounts}`;
+    els.resultsOutput.scrollTop = els.resultsOutput.scrollHeight;
+  }
+
+  function appendResult(r) {
+    const email = String(r.email || '');
+    if (!email) return;
+
+    // If already success for this email, ignore later failures.
+    if (!r.success) {
+      if (resultRecords.some((x) => x.email === email && x.success)) return;
     }
 
-    const line = r.success
-      ? `${r.email}----${r.password}----${r.clientId || '内置ID'}----${r.token}`
-      : `${r.email}----${r.password}----FAILED----${r.error}`;
-    const current = els.resultsOutput.value.trim();
-    els.resultsOutput.value = current ? current + '\n' + line : line;
-    els.resultsOutput.scrollTop = els.resultsOutput.scrollHeight;
-    const count = els.resultsOutput.value.split('\n').filter(l => l.trim()).length;
-    els.resultCount.textContent = count;
-    if (totalAccounts) els.progressText.textContent = `${count}/${totalAccounts}`;
+    // On success, drop any prior failure/duplicate for same email.
+    if (r.success) {
+      resultRecords = resultRecords.filter((x) => x.email !== email);
+    } else {
+      // Keep only latest failure per email when not success.
+      resultRecords = resultRecords.filter((x) => !(x.email === email && !x.success));
+    }
+
+    resultRecords.push({
+      seq: ++resultSeq,
+      success: !!r.success,
+      email,
+      password: r.password || '',
+      clientId: r.clientId || '',
+      token: r.token || '',
+      error: r.error || ''
+    });
+    renderResults();
+  }
+
+  if (els.resultSortSelect) {
+    els.resultSortSelect.addEventListener('change', () => {
+      resultSortMode = els.resultSortSelect.value === 'status' ? 'status' : 'order';
+      chrome.storage.local.set({ resultSortMode });
+      renderResults();
+      addLog(
+        resultSortMode === 'status' ? '处理结果已按状态分组（成功在前）' : '处理结果已按执行先后排序',
+        'info'
+      );
+    });
   }
 
   function addLog(message, level = 'info') {
