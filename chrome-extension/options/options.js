@@ -1,5 +1,5 @@
 document.addEventListener('DOMContentLoaded', () => {
-  const MAX_FIXED = 10;
+  const MAX_FIXED = 100;
   const fields = [
     'backupEmail',
     'backupEmailDomain',
@@ -7,7 +7,13 @@ document.addEventListener('DOMContentLoaded', () => {
     'tempEmailApiUrl',
     'tempEmailAdminPassword',
     'customClientId',
-    'apiMode'
+    'apiMode',
+    'proxyEnabled',
+    'proxyType',
+    'proxyHost',
+    'proxyPort',
+    'proxyUsername',
+    'proxyPassword'
   ];
 
   function parseFixedList(text) {
@@ -31,6 +37,39 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function toggleProxyFields() {
+    const enabled = document.getElementById('proxyEnabled')?.checked;
+    const box = document.getElementById('proxyFields');
+    if (!box) return;
+    // Keep fields editable so user can fill + test before enabling permanently.
+    box.style.opacity = enabled ? '1' : '0.85';
+  }
+
+  function readProxyForm() {
+    return {
+      proxyEnabled: !!document.getElementById('proxyEnabled')?.checked,
+      proxyType: document.getElementById('proxyType')?.value === 'socks5' ? 'socks5' : 'http',
+      proxyHost: (document.getElementById('proxyHost')?.value || '').trim(),
+      proxyPort: (document.getElementById('proxyPort')?.value || '').trim(),
+      proxyUsername: (document.getElementById('proxyUsername')?.value || '').trim(),
+      proxyPassword: document.getElementById('proxyPassword')?.value || ''
+    };
+  }
+
+  function validateProxy(data, { requireEnabled = true } = {}) {
+    if (requireEnabled && !data.proxyEnabled) return null;
+    const host = (data.proxyHost || '').trim();
+    const portStr = String(data.proxyPort || '').trim();
+    if (!host) return '⚠️ 请填写代理主机地址';
+    if (!/^\d+$/.test(portStr)) return '⚠️ 代理端口必须是数字';
+    const port = Number(portStr);
+    if (port < 1 || port > 65535) return '⚠️ 代理端口需在 1–65535';
+    if (data.proxyType !== 'http' && data.proxyType !== 'socks5') {
+      return '⚠️ 代理类型仅支持 HTTP 或 SOCKS5';
+    }
+    return null;
+  }
+
   // Load
   chrome.storage.local.get([...fields, 'clientIdMode', 'backupEmailMode', 'backupEmailList'], (result) => {
     fields.forEach(f => {
@@ -40,6 +79,8 @@ document.addEventListener('DOMContentLoaded', () => {
           el.checked = !!result[f];
         } else if (f === 'apiMode') {
           el.value = result[f] || 'graph';
+        } else if (f === 'proxyType') {
+          el.value = result[f] === 'socks5' ? 'socks5' : 'http';
         } else {
           el.value = result[f] || '';
         }
@@ -70,6 +111,7 @@ document.addEventListener('DOMContentLoaded', () => {
     toggleCustomId();
     toggleBackupMode();
     updateRandomPreview();
+    toggleProxyFields();
   });
 
   document.querySelectorAll('input[name="clientIdMode"]').forEach(radio => {
@@ -83,6 +125,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   document.getElementById('backupEmailDomain')?.addEventListener('input', updateRandomPreview);
   document.getElementById('backupEmailList')?.addEventListener('input', updateFixedCountHint);
+  document.getElementById('proxyEnabled')?.addEventListener('change', toggleProxyFields);
 
   function toggleCustomId() {
     const isCustom = document.getElementById('modeCustom').checked;
@@ -123,6 +166,49 @@ document.addEventListener('DOMContentLoaded', () => {
       pwdInput.type = 'password';
       e.target.textContent = '👁️ 显示';
     }
+  });
+
+  // Test proxy connectivity / latency
+  document.getElementById('testProxyBtn')?.addEventListener('click', () => {
+    const resultDiv = document.getElementById('proxyTestResult');
+    const btn = document.getElementById('testProxyBtn');
+    const form = readProxyForm();
+    const err = validateProxy(form, { requireEnabled: false });
+    if (err) {
+      resultDiv.textContent = err;
+      resultDiv.style.color = '#f59e0b';
+      return;
+    }
+
+    btn.disabled = true;
+    resultDiv.style.color = '#0078d4';
+    resultDiv.textContent = `⏳ 正在通过 ${form.proxyType.toUpperCase()} ${form.proxyHost}:${form.proxyPort} 测试...`;
+
+    chrome.runtime.sendMessage({
+      action: 'testProxyConnection',
+      proxy: form
+    }, (resp) => {
+      btn.disabled = false;
+      const runtimeErr = chrome.runtime.lastError;
+      if (runtimeErr) {
+        resultDiv.style.color = '#f14c4c';
+        resultDiv.textContent = `❌ 测试失败：${runtimeErr.message}`;
+        return;
+      }
+      if (!resp || resp.ok === false) {
+        resultDiv.style.color = '#f14c4c';
+        resultDiv.textContent = `❌ 连接失败：${resp?.error || '未知错误'}`;
+        return;
+      }
+      resultDiv.style.color = '#28a745';
+      const ipPart = resp.ip ? ` · 出口 IP ${resp.ip}` : '';
+      const regionPart = resp.region ? ` · 地区 ${resp.region}` : '';
+      const msPart = typeof resp.latencyMs === 'number' ? `${resp.latencyMs} ms` : '—';
+      const urlPart = resp.url ? ` · ${resp.url}` : '';
+      const ctxPart = resp.context ? ` · ${resp.context}` : '';
+      const notePart = resp.note ? ` · ${resp.note}` : '';
+      resultDiv.textContent = `✅ 连接正常 · 延迟 ${msPart}${ipPart}${regionPart}${urlPart}${ctxPart}${notePart}`;
+    });
   });
 
   // Test API Connection
@@ -172,32 +258,65 @@ document.addEventListener('DOMContentLoaded', () => {
     data.clientIdMode = document.querySelector('input[name="clientIdMode"]:checked').value;
     data.backupEmailMode = document.querySelector('input[name="backupEmailMode"]:checked').value;
     if (data.backupEmailDomain) data.backupEmailDomain = data.backupEmailDomain.replace(/^@/, '');
+    data.proxyType = data.proxyType === 'socks5' ? 'socks5' : 'http';
+    data.proxyEnabled = !!data.proxyEnabled;
 
     const fixedList = parseFixedList(document.getElementById('backupEmailList')?.value || '');
     data.backupEmailList = fixedList;
     // Keep legacy single field as first entry for older code paths.
     data.backupEmail = fixedList[0] || '';
 
+    const status = document.getElementById('status');
     if (data.backupEmailMode === 'fixed' && !fixedList.length) {
-      const status = document.getElementById('status');
-      status.textContent = '⚠️ 固定模式请至少填写 1 个备用邮箱（最多 10 个）';
+      status.textContent = '⚠️ 固定模式请至少填写 1 个备用邮箱（最多 100 个）';
       status.style.color = '#f59e0b';
       return;
     }
     if (data.backupEmailMode === 'random' && !data.backupEmailDomain) {
-      const status = document.getElementById('status');
       status.textContent = '⚠️ 随机模式请填写邮箱域名';
+      status.style.color = '#f59e0b';
+      return;
+    }
+    const proxyErr = validateProxy(data);
+    if (proxyErr) {
+      status.textContent = proxyErr;
       status.style.color = '#f59e0b';
       return;
     }
 
     chrome.storage.local.set(data, () => {
-      const status = document.getElementById('status');
-      status.style.color = 'var(--success)';
-      status.textContent = data.backupEmailMode === 'fixed'
-        ? `✅ 设置已保存（固定备用邮箱 ${fixedList.length} 个）`
-        : '✅ 设置已保存';
-      setTimeout(() => { status.textContent = ''; }, 2000);
+      // Apply proxy via background so auth listener stays in SW.
+      chrome.runtime.sendMessage({ action: 'applyProxySettings' }, (resp) => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          status.style.color = '#f59e0b';
+          status.textContent = `⚠️ 设置已保存，但代理应用失败: ${err.message}`;
+          return;
+        }
+        if (resp && resp.ok === false) {
+          status.style.color = '#f59e0b';
+          status.textContent = `⚠️ 设置已保存，但代理应用失败: ${resp.error || '未知错误'}`;
+          return;
+        }
+        let msg = data.backupEmailMode === 'fixed'
+          ? `✅ 设置已保存（固定备用邮箱 ${fixedList.length} 个）`
+          : '✅ 设置已保存';
+        if (data.proxyEnabled) {
+          status.style.color = 'var(--success)';
+          msg += ` · 代理已启用 ${data.proxyType.toUpperCase()} ${data.proxyHost}:${data.proxyPort}`;
+          status.textContent = msg;
+          setTimeout(() => { status.textContent = ''; }, 3000);
+        } else if ((data.proxyHost || '').trim() && String(data.proxyPort || '').trim()) {
+          // Filled but not enabled — easy to miss the checkbox.
+          status.style.color = '#f59e0b';
+          status.textContent = `${msg} · 代理地址已填写但未启用。请勾选上方「启用代理」后再保存，浏览器才会走代理`;
+        } else {
+          status.style.color = 'var(--success)';
+          msg += ' · 未启用代理';
+          status.textContent = msg;
+          setTimeout(() => { status.textContent = ''; }, 3000);
+        }
+      });
     });
   });
 });

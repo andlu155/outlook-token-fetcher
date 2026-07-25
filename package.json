@@ -1,6 +1,6 @@
 {
   "name": "outlook-token-fetcher",
-  "version": "1.26.0",
+  "version": "1.27.0",
   "description": "Chrome extension for semi-automatic Outlook / Microsoft OAuth2 refresh token fetching",
   "private": true,
   "scripts": {

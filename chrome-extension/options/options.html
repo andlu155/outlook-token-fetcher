@@ -95,9 +95,9 @@
         </div>
       </div>
       <div class="form-group" id="fixedEmailGroup">
-        <label>固定备用邮箱（最多 10 个，执行时按顺序轮流使用）</label>
-        <textarea id="backupEmailList" rows="5" placeholder="每行一个邮箱，最多 10 个&#10;01jing@ldymail.cc.cd&#10;02jing@ldymail.cc.cd&#10;03jing@ldymail.cc.cd" spellcheck="false"></textarea>
-        <div class="hint" id="fixedEmailCountHint">已填写 0 / 10 个。处理账号时按列表顺序循环选用。</div>
+        <label>固定备用邮箱（最多 100 个，执行时按顺序轮流使用）</label>
+        <textarea id="backupEmailList" rows="8" placeholder="每行一个邮箱，最多 100 个&#10;01jing@ldymail.cc.cd&#10;02jing@ldymail.cc.cd&#10;03jing@ldymail.cc.cd" spellcheck="false"></textarea>
+        <div class="hint" id="fixedEmailCountHint">已填写 0 / 100 个。处理账号时按列表顺序循环选用。</div>
         <!-- 兼容旧字段：保存时同步第一项到 backupEmail -->
         <input type="hidden" id="backupEmail" value="">
       </div>
@@ -148,6 +148,48 @@
         </div>
         <div id="customIdContainer" style="display:none; margin-top: 10px;">
           <input type="text" id="customClientId" placeholder="输入自定义 Client ID">
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🌐 网络代理</div>
+      <div class="form-group">
+        <input type="checkbox" id="proxyEnabled">
+        <label class="check-label" for="proxyEnabled"><strong>启用代理</strong>（必须勾选，保存后浏览器才会走代理）</label>
+        <div class="hint">勾选并保存后，本扩展会设置 Chrome 系统代理，登录/注册流量会走该代理。仅填写地址不勾选 = 不生效。普通窗口保存会同时写入普通 + 无痕；取消勾选再保存则恢复系统代理。</div>
+      </div>
+      <div id="proxyFields">
+        <div class="form-group">
+          <label>代理类型</label>
+          <select id="proxyType" style="width: 100%; padding: 8px; background: rgba(0,0,0,0.3); color: white; border: 1px solid var(--border); border-radius: var(--radius-sm);">
+            <option value="http">HTTP</option>
+            <option value="socks5">SOCKS5</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>主机地址</label>
+          <input type="text" id="proxyHost" placeholder="127.0.0.1 或 proxy.example.com" spellcheck="false">
+        </div>
+        <div class="form-group">
+          <label>端口</label>
+          <input type="text" id="proxyPort" placeholder="7890" inputmode="numeric" spellcheck="false">
+        </div>
+        <div class="form-group">
+          <label>用户名（可选）</label>
+          <input type="text" id="proxyUsername" placeholder="无需认证可留空" spellcheck="false" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label>密码（可选）</label>
+          <input type="password" id="proxyPassword" placeholder="无需认证可留空" autocomplete="off">
+          <div class="hint">HTTP 代理认证支持较好；SOCKS5 带用户名密码取决于浏览器实现，不保证可用。</div>
+        </div>
+        <div class="form-group">
+          <div class="inline-group">
+            <button type="button" id="testProxyBtn" class="btn" style="border-color:var(--accent);color:var(--accent);">⚡ 测试连接 / 测速</button>
+          </div>
+          <div class="hint" style="margin-top:6px;">使用上方填写的代理临时测一次（不必先保存），测完自动恢复原设置。主探测站 Cloudflare（cdn-cgi/trace），失败时回退 ipify / Microsoft；成功后查询出口 IP 真实地区。无痕窗口内测试会写入无痕会话代理。</div>
+          <div id="proxyTestResult" style="font-size:12px;margin-top:6px;font-weight:600;"></div>
         </div>
       </div>
     </div>

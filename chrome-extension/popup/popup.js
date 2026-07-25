@@ -53,10 +53,10 @@ document.addEventListener('DOMContentLoaded', () => {
   els.modeAuto.addEventListener('click', () => setMode('auto'));
   els.modeManual.addEventListener('click', () => setMode('step-by-step'));
 
-  // Load saved mode / queue state (results stay in the panel only; no auto local files)
+  // Load saved mode / queue / results (results are persisted in storage so accidental panel/window close does not wipe them)
   chrome.storage.local.get([
     'savedAccounts', 'sw_running', 'sw_paused', 'execMode',
-    'sw_current', 'sw_queue', 'resultSortMode'
+    'sw_current', 'sw_queue', 'sw_results', 'resultSortMode'
   ], (r) => {
     if (r.savedAccounts) els.accountInput.value = r.savedAccounts;
     if (r.execMode) setMode(r.execMode);
@@ -66,18 +66,64 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     updateCount();
 
-    // 强制清理残留状态：如果后台脚本并没有真的在运行（或者重启了浏览器），不能仅仅因为 sw_current 残留就变为 paused
-    // 我们必须信任 sw_running 或 sw_paused，如果两者都不为 true，强制进入 idle
-    if (r.sw_running) {
-      setUiState('running');
-    } else if (r.sw_paused) {
-      setUiState('paused');
-      if (r.sw_current?.email) els.currentAccountText.textContent = r.sw_current.email + '（已暂停）';
-    } else {
-      setUiState('idle');
-      // 可以顺手清理一下残留队列
-      chrome.storage.local.remove(['sw_current', 'sw_queue']);
+    // Restore prior batch results after side panel / window reopen.
+    restoreResultsFromStorage(r.sw_results);
+
+    function applyProgress(done, remaining, hasCurrent) {
+      const total = done + remaining + (hasCurrent ? 1 : 0);
+      if (total) {
+        totalAccounts = total;
+        els.progressText.textContent = `${done}/${total}`;
+      }
     }
+
+    // Prefer live SW status (handles window-crash → auto-pause).
+    chrome.runtime.sendMessage({ action: 'getTaskStatus' }, (status) => {
+      if (chrome.runtime.lastError || !status) {
+        // Fallback to storage flags if SW is unavailable.
+        if (r.sw_paused || (r.sw_running && (r.sw_current || (r.sw_queue && r.sw_queue.length)))) {
+          setUiState('paused');
+          if (r.sw_current?.email) els.currentAccountText.textContent = r.sw_current.email + '（已暂停）';
+          applyProgress(
+            resultRecords.length,
+            Array.isArray(r.sw_queue) ? r.sw_queue.length : 0,
+            !!r.sw_current
+          );
+          addLog('任务已中断并暂停，可点“继续”恢复', 'warning');
+        } else if (r.sw_running) {
+          setUiState('running');
+          if (r.sw_current?.email) els.currentAccountText.textContent = r.sw_current.email;
+          applyProgress(
+            resultRecords.length,
+            Array.isArray(r.sw_queue) ? r.sw_queue.length : 0,
+            !!r.sw_current
+          );
+        } else {
+          setUiState('idle');
+        }
+        return;
+      }
+
+      // Prefer fresher results from SW if present.
+      if (Array.isArray(status.results) && status.results.length && !resultRecords.length) {
+        restoreResultsFromStorage(status.results);
+      }
+
+      if (status.running) {
+        setUiState('running');
+        if (status.account) els.currentAccountText.textContent = status.account;
+        applyProgress(status.done || resultRecords.length, status.queueLen || 0, !!status.account);
+      } else if (status.paused || status.hasWork) {
+        setUiState('paused');
+        if (status.account) els.currentAccountText.textContent = status.account + '（已暂停）';
+        applyProgress(status.done || resultRecords.length, status.queueLen || 0, !!status.account);
+        addLog('任务已暂停（含异常关闭恢复），可点“继续”从当前账号恢复', 'warning');
+      } else {
+        setUiState('idle');
+        // Only clear residual queue when truly idle with no work.
+        chrome.storage.local.remove(['sw_current', 'sw_queue']);
+      }
+    });
   });
 
   // Account count
@@ -296,6 +342,41 @@ document.addEventListener('DOMContentLoaded', () => {
     els.resultsOutput.scrollTop = els.resultsOutput.scrollHeight;
   }
 
+  function normalizeStoredResult(r, seq) {
+    return {
+      seq,
+      success: !!r.success,
+      email: String(r.email || ''),
+      password: r.password || '',
+      clientId: r.clientId || '',
+      token: r.token || '',
+      error: r.error || ''
+    };
+  }
+
+  function restoreResultsFromStorage(list) {
+    if (!Array.isArray(list) || !list.length) return;
+    resultRecords = [];
+    resultSeq = 0;
+    for (const raw of list) {
+      const email = String(raw?.email || '');
+      if (!email) continue;
+      // Prefer success over later failures for same email (same rules as appendResult).
+      if (raw.success) {
+        resultRecords = resultRecords.filter((x) => x.email !== email);
+      } else if (resultRecords.some((x) => x.email === email && x.success)) {
+        continue;
+      } else {
+        resultRecords = resultRecords.filter((x) => !(x.email === email && !x.success));
+      }
+      resultRecords.push(normalizeStoredResult(raw, ++resultSeq));
+    }
+    renderResults();
+    if (resultRecords.length) {
+      addLog(`已恢复上次处理结果 ${resultRecords.length} 条（侧栏/窗口关闭后仍保留）`, 'info');
+    }
+  }
+
   function appendResult(r) {
     const email = String(r.email || '');
     if (!email) return;
@@ -313,15 +394,7 @@ document.addEventListener('DOMContentLoaded', () => {
       resultRecords = resultRecords.filter((x) => !(x.email === email && !x.success));
     }
 
-    resultRecords.push({
-      seq: ++resultSeq,
-      success: !!r.success,
-      email,
-      password: r.password || '',
-      clientId: r.clientId || '',
-      token: r.token || '',
-      error: r.error || ''
-    });
+    resultRecords.push(normalizeStoredResult(r, ++resultSeq));
     renderResults();
   }
 

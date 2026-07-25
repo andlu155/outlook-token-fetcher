@@ -174,7 +174,7 @@ function parseFixedBackupList(settingsObj = settings) {
   if (!list.length && settingsObj.backupEmail) {
     list = String(settingsObj.backupEmail).split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
   }
-  return list.slice(0, 10);
+  return list.slice(0, 100);
 }
 
 // Resolve backup email from settings: multi fixed (round-robin), or random local-part @ domain.
@@ -250,10 +250,523 @@ function markDirty() {
   stateDirty = true;
 }
 
+// ============== Proxy (HTTP / SOCKS5) ==============
+// In-memory credentials for chrome.webRequest.onAuthRequired (HTTP proxy auth).
+let proxyAuthCredentials = null;
+let proxyAuthListenerAttached = false;
+
+function readProxyConfig(raw) {
+  const enabled = !!raw?.proxyEnabled;
+  const type = raw?.proxyType === 'socks5' ? 'socks5' : 'http';
+  const host = String(raw?.proxyHost || '').trim();
+  const port = Number(String(raw?.proxyPort || '').trim());
+  const username = String(raw?.proxyUsername || '').trim();
+  const password = String(raw?.proxyPassword || '');
+  return { enabled, type, host, port, username, password };
+}
+
+function validateProxyConfig(cfg) {
+  if (!cfg.enabled) return null;
+  if (!cfg.host) return '代理主机不能为空';
+  if (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535) {
+    return '代理端口无效（需 1–65535）';
+  }
+  if (cfg.type !== 'http' && cfg.type !== 'socks5') return '代理类型无效';
+  return null;
+}
+
+function ensureProxyAuthListener() {
+  if (proxyAuthListenerAttached) return;
+  if (!chrome.webRequest?.onAuthRequired) return;
+  chrome.webRequest.onAuthRequired.addListener(
+    (details, callback) => {
+      if (details.isProxy && proxyAuthCredentials?.username) {
+        callback({ authCredentials: { ...proxyAuthCredentials } });
+        return;
+      }
+      callback();
+    },
+    { urls: ['<all_urls>'] },
+    ['asyncBlocking']
+  );
+  proxyAuthListenerAttached = true;
+}
+
+function setProxyAuth(cfg) {
+  if (cfg?.enabled && cfg.username) {
+    proxyAuthCredentials = {
+      username: cfg.username,
+      password: cfg.password || ''
+    };
+    ensureProxyAuthListener();
+  } else {
+    proxyAuthCredentials = null;
+  }
+}
+
+// Incognito SW cannot touch scope "regular".
+// - regular: write regular + incognito_persistent so 无痕也能用
+// - incognito: write session_only (必成) + persistent (尽量持久)
+function isIncognitoContext() {
+  return !!chrome.extension?.inIncognitoContext;
+}
+
+function proxyScopesForWrite() {
+  if (isIncognitoContext()) return ['incognito_session_only', 'incognito_persistent'];
+  return ['regular', 'incognito_persistent'];
+}
+
+// Primary scope must succeed; secondary (e.g. incognito_persistent) is best-effort.
+function applyProxyScopes(scopes, applyOne) {
+  return new Promise((resolve) => {
+    if (!scopes.length) {
+      resolve({ ok: false, error: '无可用代理作用域' });
+      return;
+    }
+    const primary = scopes[0];
+    const errors = {};
+    let left = scopes.length;
+    let primaryOk = false;
+
+    const finish = () => {
+      if (primaryOk) {
+        const warning = Object.entries(errors)
+          .filter(([s]) => s !== primary)
+          .map(([s, m]) => `${s}: ${m}`)
+          .join('; ') || undefined;
+        resolve({ ok: true, scopes, warning });
+        return;
+      }
+      resolve({
+        ok: false,
+        error: errors[primary] || Object.values(errors)[0] || '设置代理失败',
+        scopes
+      });
+    };
+
+    for (const scope of scopes) {
+      try {
+        applyOne(scope, (errMsg) => {
+          if (errMsg) errors[scope] = errMsg;
+          else if (scope === primary) primaryOk = true;
+          left -= 1;
+          if (left === 0) finish();
+        });
+      } catch (e) {
+        errors[scope] = e?.message || String(e);
+        left -= 1;
+        if (left === 0) finish();
+      }
+    }
+  });
+}
+
+function clearBrowserProxy() {
+  return applyProxyScopes(proxyScopesForWrite(), (scope, done) => {
+    chrome.proxy.settings.clear({ scope }, () => {
+      done(chrome.runtime.lastError?.message || null);
+    });
+  });
+}
+
+function setBrowserProxy(cfg) {
+  const config = {
+    mode: 'fixed_servers',
+    rules: {
+      singleProxy: {
+        scheme: cfg.type === 'socks5' ? 'socks5' : 'http',
+        host: cfg.host,
+        port: cfg.port
+      },
+      bypassList: ['<local>']
+    }
+  };
+  return applyProxyScopes(proxyScopesForWrite(), (scope, done) => {
+    chrome.proxy.settings.set({ value: config, scope }, () => {
+      done(chrome.runtime.lastError?.message || null);
+    });
+  });
+}
+
+async function applyProxyFromStorage(raw) {
+  const source = raw || (await chrome.storage.local.get([
+    'proxyEnabled', 'proxyType', 'proxyHost', 'proxyPort', 'proxyUsername', 'proxyPassword'
+  ]));
+  const cfg = readProxyConfig(source);
+  const invalid = validateProxyConfig(cfg);
+  if (invalid) {
+    setProxyAuth(null);
+    await clearBrowserProxy();
+    return { ok: false, error: invalid };
+  }
+  if (!cfg.enabled) {
+    setProxyAuth(null);
+    const cleared = await clearBrowserProxy();
+    if (cleared.ok) console.log('[proxy] cleared (system default)');
+    return cleared.ok ? { ok: true, enabled: false } : cleared;
+  }
+  setProxyAuth(cfg);
+  const applied = await setBrowserProxy(cfg);
+  if (applied.ok) {
+    console.log(`[proxy] applied ${cfg.type} ${cfg.host}:${cfg.port}`);
+    return {
+      ok: true,
+      enabled: true,
+      type: cfg.type,
+      host: cfg.host,
+      port: cfg.port
+    };
+  }
+  return applied;
+}
+
+function parseExitProbe(text, contentType) {
+  const body = String(text || '');
+  let ip = null;
+  let country = null;
+  let region = null;
+  let city = null;
+  let org = null;
+
+  // cloudflare cdn-cgi/trace: ip=... / loc=US / colo=SFO
+  const cfIp = body.match(/(?:^|\n)ip=([0-9a-fA-F:.]+)/);
+  if (cfIp?.[1]) ip = cfIp[1];
+  const cfLoc = body.match(/(?:^|\n)loc=([A-Z]{2})/);
+  if (cfLoc?.[1]) country = cfLoc[1];
+
+  try {
+    if (/json/i.test(contentType || '') || body.trim().startsWith('{')) {
+      const j = JSON.parse(body);
+      if (!ip) {
+        if (j.ip) ip = String(j.ip);
+        else if (j.origin) ip = String(j.origin).split(',')[0].trim();
+        else if (j.query) ip = String(j.query);
+      }
+      country = country || j.country_code || j.countryCode || j.country || null;
+      region = j.region || j.regionName || j.region_name || null;
+      city = j.city || null;
+      org = j.org || j.isp || j.as || null;
+      if (typeof country === 'string' && country.length > 3 && j.country_name) {
+        // ipwho/ipapi style: country is full name
+        country = j.country_code || j.countryCode || country;
+      }
+    }
+  } catch (_) { /* ignore */ }
+
+  if (!ip) {
+    const plain = body.trim();
+    if (/^[0-9a-fA-F:.]+$/.test(plain)) ip = plain;
+  }
+  return { ip, country, region, city, org };
+}
+
+function formatRegion({ country, region, city, org }) {
+  const parts = [];
+  if (city) parts.push(String(city));
+  if (region && String(region) !== String(city)) parts.push(String(region));
+  if (country) parts.push(String(country));
+  let s = parts.filter(Boolean).join(', ');
+  if (org) s = s ? `${s} · ${org}` : String(org);
+  return s || null;
+}
+
+async function fetchWithTimeout(url, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      cache: 'no-store',
+      signal: ctrl.signal,
+      credentials: 'omit',
+      redirect: 'follow'
+    });
+    const text = await res.text();
+    return {
+      ok: res.ok,
+      status: res.status,
+      text,
+      contentType: res.headers.get('content-type') || ''
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Enrich IP with city/region/ISP via free HTTPS geo APIs (best-effort).
+async function lookupIpGeo(ip) {
+  if (!ip) return null;
+  const urls = [
+    `https://ipwho.is/${encodeURIComponent(ip)}`,
+    `https://ipapi.co/${encodeURIComponent(ip)}/json/`
+  ];
+  for (const url of urls) {
+    try {
+      const res = await fetchWithTimeout(url, 8000);
+      if (!res.ok) continue;
+      const j = JSON.parse(res.text);
+      // ipwho.is uses success:false on error
+      if (j && j.success === false) continue;
+      if (j && j.error) continue;
+      const country = j.country_code || j.countryCode || j.country || null;
+      const region = j.region || j.regionName || j.region_name || null;
+      const city = j.city || null;
+      const org = j.org || j.isp || j.connection?.isp || j.as || null;
+      const label = formatRegion({ country, region, city, org });
+      if (label) return { country, region, city, org, label };
+    } catch (_) { /* try next */ }
+  }
+  return null;
+}
+
+// Temporarily apply form proxy, measure latency + exit IP/region, then restore saved proxy.
+async function testProxyConnection(rawForm) {
+  const cfg = readProxyConfig({ ...rawForm, proxyEnabled: true });
+  const invalid = validateProxyConfig(cfg);
+  if (invalid) return { ok: false, error: invalid };
+
+  const prev = await chrome.storage.local.get([
+    'proxyEnabled', 'proxyType', 'proxyHost', 'proxyPort', 'proxyUsername', 'proxyPassword'
+  ]);
+
+  // Primary: Cloudflare trace (ip + country). Fallbacks if blocked.
+  const TEST_URLS = [
+    { url: 'https://www.cloudflare.com/cdn-cgi/trace', label: 'cloudflare' },
+    { url: 'https://api.ipify.org?format=json', label: 'ipify' },
+    { url: 'https://www.msftconnecttest.com/connecttest.txt', label: 'msft' }
+  ];
+  const TIMEOUT_MS = 12000;
+  const context = chrome.extension?.inIncognitoContext ? '无痕' : '普通';
+
+  try {
+    setProxyAuth(cfg);
+    const applied = await setBrowserProxy(cfg);
+    if (!applied.ok) {
+      let err = applied.error || '无法应用代理设置';
+      if (/incognito|regular settings/i.test(err)) {
+        err = `${err}（当前为${context}模式，已按上下文选择代理作用域仍失败）`;
+      }
+      return { ok: false, error: err };
+    }
+    // Give chrome.proxy a brief moment to take effect.
+    await sleep(400);
+
+    let lastError = '全部探测地址均失败';
+    for (const item of TEST_URLS) {
+      const started = Date.now();
+      try {
+        const res = await fetchWithTimeout(item.url, TIMEOUT_MS);
+        const latencyMs = Date.now() - started;
+        if (!res.ok && res.status >= 500) {
+          lastError = `${item.label} HTTP ${res.status}`;
+          continue;
+        }
+        if (!res.ok && res.status !== 0) {
+          if (res.status === 403 || res.status === 401) {
+            const probe = parseExitProbe(res.text, res.contentType);
+            let region = formatRegion(probe);
+            if (probe.ip && !probe.city) {
+              const geo = await lookupIpGeo(probe.ip);
+              if (geo?.label) region = geo.label;
+            }
+            return {
+              ok: true,
+              latencyMs,
+              ip: probe.ip,
+              region,
+              url: item.label,
+              context,
+              note: `HTTP ${res.status}（代理已通，探测站拒绝）`
+            };
+          }
+          lastError = `${item.label} HTTP ${res.status}`;
+          continue;
+        }
+        const probe = parseExitProbe(res.text, res.contentType);
+        let region = formatRegion(probe);
+        // Cloudflare only gives country code — look up city/region/ISP.
+        if (probe.ip && (!probe.city || !probe.region)) {
+          const geo = await lookupIpGeo(probe.ip);
+          if (geo?.label) region = geo.label;
+        }
+        return {
+          ok: true,
+          latencyMs,
+          ip: probe.ip,
+          region,
+          url: item.label,
+          context
+        };
+      } catch (e) {
+        const name = e?.name || '';
+        const msg = e?.message || String(e);
+        if (name === 'AbortError') {
+          lastError = `${item.label} 超时（>${TIMEOUT_MS}ms）`;
+        } else {
+          lastError = `${item.label}: ${msg}`;
+        }
+      }
+    }
+    return { ok: false, error: lastError };
+  } finally {
+    try {
+      await applyProxyFromStorage(prev);
+    } catch (e) {
+      console.warn('[proxy] restore after test failed:', e?.message || e);
+    }
+  }
+}
+
+/**
+ * After SW cold start / window crash: rehydrate batch state.
+ * If a batch was running but the auth tab is gone, force paused so user can click 继续.
+ */
+async function recoverInterruptedBatch() {
+  const d = await chrome.storage.local.get([
+    'sw_queue', 'sw_current', 'sw_tabId', 'sw_results',
+    'sw_running', 'sw_paused', 'sw_mode', 'sw_settings', 'sw_backupEmailCursor'
+  ]);
+  const hasWork = !!(d.sw_current || (Array.isArray(d.sw_queue) && d.sw_queue.length > 0));
+  if (!hasWork && !d.sw_running && !d.sw_paused) return;
+
+  // Rehydrate memory from storage (SW just woke empty).
+  accountsQueue = d.sw_queue || [];
+  currentAccount = d.sw_current || null;
+  currentTabId = d.sw_tabId || null;
+  results = d.sw_results || [];
+  currentMode = d.sw_mode || 'auto';
+  settings = d.sw_settings || {};
+  if (typeof d.sw_backupEmailCursor === 'number') backupEmailCursor = d.sw_backupEmailCursor;
+
+  let tabAlive = false;
+  if (currentTabId) {
+    try {
+      await chrome.tabs.get(currentTabId);
+      tabAlive = true;
+    } catch (_) {
+      currentTabId = null;
+    }
+  }
+
+  // Was running but auth tab vanished (window/tab closed) → pause, keep queue/results.
+  if (d.sw_running && hasWork && !tabAlive) {
+    isRunning = false;
+    isPaused = true;
+    markDirty();
+    await saveState();
+    sendLog('检测到窗口/登录页异常关闭，任务已暂停（队列与结果已保留），可点“继续”恢复', 'warning');
+    return;
+  }
+
+  // Storage already paused, or orphaned work with neither flag (legacy tab-close bug).
+  if (hasWork && (d.sw_paused || (!d.sw_running && !d.sw_paused))) {
+    isRunning = false;
+    isPaused = true;
+    markDirty();
+    await saveState();
+    if (!d.sw_paused) {
+      sendLog('检测到未完成任务，已切换为暂停，可点“继续”恢复', 'warning');
+    }
+    return;
+  }
+
+  // Running and tab still there — restore flags in memory.
+  if (d.sw_running && hasWork && tabAlive) {
+    isRunning = true;
+    isPaused = false;
+    return;
+  }
+
+  // Stale running/paused flags with no work.
+  if (!hasWork && (d.sw_running || d.sw_paused)) {
+    isRunning = false;
+    isPaused = false;
+    currentAccount = null;
+    accountsQueue = [];
+    currentTabId = null;
+    markDirty();
+    await saveState();
+  }
+}
+
+/** Re-check auth tab; if batch was running but tab is gone, force paused. */
+async function ensureTaskStateConsistent() {
+  if (!isRunning && !isPaused && !currentAccount && accountsQueue.length === 0) {
+    await loadState();
+  }
+  const hasWork = !!(currentAccount || accountsQueue.length > 0);
+  if (!hasWork) return;
+
+  let tabAlive = false;
+  if (currentTabId) {
+    try {
+      await chrome.tabs.get(currentTabId);
+      tabAlive = true;
+    } catch (_) {
+      currentTabId = null;
+    }
+  }
+
+  if (isRunning && !tabAlive) {
+    isRunning = false;
+    isPaused = true;
+    markDirty();
+    await saveState();
+    sendLog('登录页面已不存在，任务已暂停，可点“继续”恢复', 'warning');
+  } else if (!isRunning && !isPaused && hasWork) {
+    isPaused = true;
+    markDirty();
+    await saveState();
+  }
+}
+
+function buildTaskStatus() {
+  const hasWork = !!(currentAccount || accountsQueue.length > 0);
+  return {
+    running: !!isRunning,
+    paused: !!isPaused,
+    hasWork,
+    account: currentAccount?.email || null,
+    queueLen: accountsQueue.length,
+    results,
+    done: results.length,
+    total: results.length + accountsQueue.length + (currentAccount ? 1 : 0)
+  };
+}
+
+// Re-apply saved proxy when SW wakes / extension loads; recover interrupted batch.
+(async () => {
+  try {
+    await applyProxyFromStorage();
+  } catch (e) {
+    console.warn('[proxy] startup apply failed:', e?.message || e);
+  }
+  try {
+    await recoverInterruptedBatch();
+  } catch (e) {
+    console.warn('[recover] interrupted batch recovery failed:', e?.message || e);
+  }
+})();
+
 // ============== Message Handler ==============
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   loadState().then(async () => {
     switch (msg.action) {
+      case 'applyProxySettings': {
+        const result = await applyProxyFromStorage();
+        sendResponse(result);
+        return;
+      }
+      case 'testProxyConnection': {
+        const result = await testProxyConnection(msg.proxy || {});
+        sendResponse(result);
+        return;
+      }
+      case 'getTaskStatus': {
+        await ensureTaskStateConsistent();
+        sendResponse(buildTaskStatus());
+        return;
+      }
       case 'start':
         currentMode = msg.mode || 'auto';
         settings = await chrome.storage.local.get(null);
@@ -1072,14 +1585,23 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (tabId !== currentTabId) return;
     if (currentAccount?.closingAuthTab || currentAccount?.isFetchingToken) {
       currentTabId = null;
+      markDirty();
       await saveState();
       return;
     }
-    sendLog('登录页面被关闭，任务暂停', 'warning');
+    // Keep queue / current / results — enter paused so user can click 继续.
     currentTabId = null;
     isRunning = false;
+    isPaused = true;
+    markDirty();
     await saveState();
-    broadcastToPopup({ type: 'paused' });
+    sendLog('登录页面被关闭，任务已暂停（可点“继续”恢复）', 'warning');
+    broadcastToPopup({
+      type: 'paused',
+      resumable: true,
+      account: currentAccount?.email || null,
+      remaining: accountsQueue.length + (currentAccount ? 1 : 0)
+    });
   });
 });
 

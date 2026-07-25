@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Outlook Token Fetcher",
-  "version": "1.26",
-  "description": "半自动获取 Outlook 账号 OAuth2 刷新令牌 — 多固定备用邮箱轮流；自动/逐步骤；下一账号；每5账号清缓存；SSL硬错误直接跳过；密码错误/密码登录不可用/登录次数过多跳过账号；Too Many Requests/请求过多跳过账号；验证码取码单飞防重复；白屏有限恢复+整任务重跑1次；正常登录过渡忽略白屏；卡住10s+异常页才恢复；验证码取码前等3s防旧码；代码发送方式页点下一步；结果按执行先后/状态分组排序；放缓防风控",
+  "version": "1.27",
+  "description": "半自动获取 Outlook 账号 OAuth2 刷新令牌 — HTTP/SOCKS5 代理与测速；备用邮箱最多100；结果持久化；异常关闭自动暂停可继续；密码/限流/锁定/人机跳过；取码单飞；结果排序导出",
   "permissions": [
     "storage",
     "tabs",
@@ -11,7 +11,10 @@
     "sidePanel",
     "browsingData",
     "cookies",
-    "webNavigation"
+    "webNavigation",
+    "proxy",
+    "webRequest",
+    "webRequestAuthProvider"
   ],
   "host_permissions": [
     "*://login.microsoftonline.com/*",
@@ -19,7 +22,8 @@
     "*://account.live.com/*",
     "*://*.microsoft.com/*",
     "*://*.live.com/*",
-    "https://*/*"
+    "https://*/*",
+    "<all_urls>"
   ],
   "action": {
     "default_title": "Outlook Token Fetcher"

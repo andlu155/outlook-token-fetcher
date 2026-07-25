@@ -501,6 +501,112 @@ function handleRateLimitSkip(source, message) {
   }).catch(() => {});
 }
 
+/** Passkey *setup* pages only (have Cancel). Not the face/fingerprint login prompt. */
+function isPasskeySetupPage(body = pageText()) {
+  const hay = String(body || '');
+  if (/设置通行密钥|Set up a passkey|Create a passkey|正在设置密钥|完成密钥设置/i.test(hay)) return true;
+  // "设置密钥" alone is weak; require passkey/密钥 setup context.
+  if (/设置密钥/i.test(hay) && /通行|passkey|Windows Hello|密钥/i.test(hay)) return true;
+  if (/passkey/i.test(hay) && /set\s*up|create|设置/i.test(hay)) return true;
+  // Windows Hello / security-key as *setup* store (not the login prompt title).
+  if (/Windows Hello/i.test(hay) && /密钥|passkey|设置|set\s*up|create/i.test(hay)) return true;
+  if (/安全密钥|security\s*key/i.test(hay) && /设置|set\s*up|create|passkey|通行/i.test(hay)) return true;
+  return false;
+}
+
+/**
+ * Face / fingerprint / PIN / security-key *login* prompt — device cannot provide → skip.
+ * Distinct from passkey setup (Cancel continues). Screenshot title:
+ * 「人脸、指纹、PIN 或安全密钥」+「你的设备将打开一个安全窗口…登录」.
+ * Returns a short reason string, or null.
+ */
+function detectBiometricPage(body = pageText()) {
+  const title = String(document.title || '');
+  const text = String(body || '');
+  const hay = (title + ' | ' + text).slice(0, 4000);
+
+  // Passkey *setup* stays on the cancel path — do not skip those accounts.
+  if (isPasskeySetupPage(hay)) return null;
+
+  // Exact-style MS title: 人脸、指纹、PIN 或安全密钥
+  if (/人脸[、,．.\s]*指纹[、,．.\s]*PIN|指纹[、,．.\s]*PIN\s*或\s*安全密钥|Face[,\s]+fingerprint[,\s]+PIN|fingerprint[,\s]+PIN\s+(or|&)\s+security\s*key/i.test(hay)) {
+    return '人脸/指纹/PIN/安全密钥';
+  }
+
+  // Security window opened for biometric / key sign-in (not passkey setup).
+  if (/打开一个安全窗口|打开安全窗口|open a security (window|dialog)/i.test(hay)
+    && /登录|sign\s*in|登入/i.test(hay)
+    && /人脸|指纹|面容|face|fingerprint|PIN|安全密钥|security\s*key|Windows Hello/i.test(hay)) {
+    return '设备生物识别/安全密钥登录';
+  }
+
+  const rules = [
+    { re: /面容|人脸|面部识别|面部认证|用你的面孔|使用面部|人脸识别|面容\s*id/i, label: '人脸识别' },
+    { re: /指纹|用你的指纹|使用指纹|指纹识别|指纹认证|touch\s*id/i, label: '指纹识别' },
+    { re: /face\s*recognition|facial\s*recognition|use\s+your\s+face|look\s+(at|into)\s+the\s+camera|sign\s+in\s+with\s+your\s+face/i, label: 'face recognition' },
+    { re: /fingerprint|use\s+your\s+fingerprint|sign\s+in\s+with\s+your\s+fingerprint|touch\s+the\s+(fingerprint\s+)?sensor/i, label: 'fingerprint' },
+    { re: /windows\s+hello\s+(face|fingerprint)|hello\s+(face|fingerprint)/i, label: 'Windows Hello 生物识别' }
+  ];
+  for (const { re, label } of rules) {
+    if (re.test(hay)) {
+      const fromTitle = title && re.test(title) ? title.trim() : '';
+      const fromBody = (text.match(re) || [])[0] || '';
+      return (fromTitle || fromBody || label).replace(/\s+/g, ' ').trim().slice(0, 120);
+    }
+  }
+  return null;
+}
+
+/** Skip current account after face/fingerprint prompt (uses existing SW skipAccount). */
+function handleBiometricSkip(source, message) {
+  if (lastAction === 'biometric-skip') return;
+  lastAction = 'biometric-skip';
+  const reason = String(message || '人脸/指纹识别').replace(/\s+/g, ' ').trim().slice(0, 160);
+  sendLog(`${source}：检测到人脸/指纹识别（${reason}），设备无法提供，跳过当前账号`, 'error');
+  chrome.runtime.sendMessage({
+    action: 'skipAccount',
+    reason: `人脸/指纹识别无法提供: ${reason}`
+  }).catch(() => {});
+}
+
+/**
+ * MS "请稍后重试 / 目前无法使你登录" interstitial — cannot continue, skip account.
+ * Result error field gets the same reason via skipAccount.
+ * Returns a short reason string, or null.
+ */
+function detectTryLaterPage(body = pageText()) {
+  const title = String(document.title || '');
+  const text = String(body || '');
+  const hay = (title + ' | ' + text).slice(0, 4000);
+
+  const rules = [
+    { re: /请稍后重试|请稍后再试|稍后再试/i, label: '请稍后重试' },
+    { re: /目前无法使[你您]登录|暂时无法使[你您]登录|目前无法登录|暂时无法登录|无法使[你您]登录/i, label: '目前无法使你登录' },
+    { re: /we (can'?t|cannot) sign you in( right now)?|unable to sign you in|try again later|please try again later/i, label: 'try again later' },
+    { re: /something went wrong.*try again|出了点问题.*稍[后後]再试/i, label: '出了点问题，请稍后重试' }
+  ];
+  for (const { re, label } of rules) {
+    if (re.test(hay)) {
+      const fromTitle = title && re.test(title) ? title.trim() : '';
+      const fromBody = (text.match(re) || [])[0] || '';
+      return (fromTitle || fromBody || label).replace(/\s+/g, ' ').trim().slice(0, 120);
+    }
+  }
+  return null;
+}
+
+/** Skip current account after "请稍后重试" login block (uses existing SW skipAccount). */
+function handleTryLaterSkip(source, message) {
+  if (lastAction === 'try-later-skip') return;
+  lastAction = 'try-later-skip';
+  const reason = String(message || '请稍后重试').replace(/\s+/g, ' ').trim().slice(0, 160);
+  sendLog(`${source}：检测到「请稍后重试」（${reason}），跳过当前账号`, 'error');
+  chrome.runtime.sendMessage({
+    action: 'skipAccount',
+    reason: `请稍后重试: ${reason}`
+  }).catch(() => {});
+}
+
 /** Meaningful login / proof / code UI — never treat as blank. */
 function hasAuthFlowUi() {
   // Password / email / proof / submit — any of these means a normal MS login step.
@@ -576,6 +682,18 @@ function detectAndRecoverErrorPage() {
       handleRateLimitSkip('异常检测', rateLimit);
       return true;
     }
+    // "请稍后重试" login block → skip account.
+    const tryLater = detectTryLaterPage(body);
+    if (tryLater) {
+      handleTryLaterSkip('异常检测', tryLater);
+      return true;
+    }
+    // Face / fingerprint login prompt → skip account.
+    const biometric = detectBiometricPage(body);
+    if (biometric) {
+      handleBiometricSkip('异常检测', biometric);
+      return true;
+    }
     const errPage = isBrowserErrorPage(body);
     // Hard SSL/network errors: sustain only (no stuck gate — error page is already stuck).
     // Soft blank: only after task stuck ≥ STUCK_MS (checked inside isNearlyBlankPage).
@@ -642,14 +760,26 @@ function classifyPage() {
     if (rateMsg) return { kind: 'rate-limit', message: rateMsg };
   }
 
+  // "请稍后重试 / 目前无法使你登录" — skip before blank/error.
+  if (isTopFrame()) {
+    const tryLater = detectTryLaterPage(body);
+    if (tryLater) return { kind: 'try-later', message: tryLater };
+  }
+
   // Hard SSL/network errors first. Soft blank only when stuck (see isNearlyBlankPage).
   if (isTopFrame() && (isBrowserErrorPage(body) || isNearlyBlankPage())) {
     return { kind: 'page-error' };
   }
 
-  // Passkey/setup-key pages can appear mid-flow after password or after backup email.
-  // Check early so they are not blocked by other heuristics.
-  if (/passkey|通行密钥|Windows Hello|正在设置密钥|设置密钥|安全密钥|security key|Set up a passkey|Create a passkey|设置通行密钥|打开安全窗口|完成密钥设置/i.test(body)) {
+  // Face / fingerprint / PIN / security-key login prompt — skip (device cannot provide).
+  // Must run BEFORE passkey-setup: title「人脸、指纹、PIN 或安全密钥」also contains 安全密钥.
+  if (isTopFrame()) {
+    const biometric = detectBiometricPage(body);
+    if (biometric) return { kind: 'biometric', message: biometric };
+  }
+
+  // Passkey *setup* only (Cancel continues). Biometric login already handled above.
+  if (isPasskeySetupPage(body)) {
     return { kind: 'passkey', cancel: findCancelButton() };
   }
 
@@ -740,6 +870,10 @@ function handleSkip() {
       return handlePasswordLoginFailure('跳过', page.message);
     case 'rate-limit':
       return handleRateLimitSkip('跳过', page.message);
+    case 'try-later':
+      return handleTryLaterSkip('跳过', page.message);
+    case 'biometric':
+      return handleBiometricSkip('跳过', page.message);
     case 'code':
       return sendLog('跳过：请手动输入备用邮箱验证码', 'warning');
     case 'proof-initial':
@@ -752,9 +886,9 @@ function handleSkip() {
     case 'code-expired':
       return sendLog('跳过：备用邮箱已验证成功，请点击“步骤 1”重开授权页', 'warning');
     case 'account-locked':
-      return sendLog('跳过：帐户已锁定，需手动点“下一步”并完成人机验证', 'warning');
+      return handleAccountLocked('跳过', page.nextBtn);
     case 'human-check':
-      return sendLog('人机验证需手动完成：请在页面上长按“按住”按钮', 'warning');
+      return handleHumanCheck('跳过', page.holdBtn);
     case 'code-send-method':
       return sendLog('跳过：请手动选择代码发送方式并点“下一步”', 'warning');
     default:
@@ -845,6 +979,14 @@ function executeStep2() {
     handleRateLimitSkip('步骤 2/4', page.message);
     return;
   }
+  if (page.kind === 'try-later') {
+    handleTryLaterSkip('步骤 2/4', page.message);
+    return;
+  }
+  if (page.kind === 'biometric') {
+    handleBiometricSkip('步骤 2/4', page.message);
+    return;
+  }
 
   if (page.kind === 'account-tile') {
     if (lastAction === 'account-tile') return;
@@ -905,17 +1047,16 @@ function executeStep2() {
   sendLog('步骤 2/4：等待 Outlook 邮箱或密码页面', 'warning');
 }
 
-// Account locked intermediate page: auto-click 下一步 to reach human-check.
+// Account locked intermediate page (leads to human check) → skip account.
 function handleAccountLocked(source, nextBtn) {
-  if (lastAction === 'account-locked') return;
-  lastAction = 'account-locked';
-  const btn = nextBtn || getSubmitButton();
-  if (btn) {
-    clickEl(btn);
-    sendLog(`${source}：检测到“帐户已锁定”，已点击下一步（接下来请完成人机验证）`, 'warning');
-  } else {
-    sendLog(`${source}：检测到“帐户已锁定”，未找到下一步按钮，请手动点击`, 'warning');
-  }
+  void nextBtn;
+  if (lastAction === 'account-locked-skip') return;
+  lastAction = 'account-locked-skip';
+  sendLog(`${source}：检测到「帐户已锁定 / 人机验证」，跳过当前账号`, 'error');
+  chrome.runtime.sendMessage({
+    action: 'skipAccount',
+    reason: '触发人机验证: 帐户已锁定'
+  }).catch(() => {});
 }
 
 // Risk-control: "where should we send the code?" dropdown page → click 下一步.
@@ -931,16 +1072,16 @@ function handleCodeSendMethod(source, nextBtn) {
   }
 }
 
-// Press-and-hold robot check — cannot automate reliably; prompt user only.
+// Press-and-hold robot check → skip account (cannot provide device interaction).
 function handleHumanCheck(source, holdBtn) {
-  if (lastAction === 'human-check') return;
-  lastAction = 'human-check';
-  sendLog(
-    `${source}：⚠️ 检测到人机验证（证明你不是机器人 / 按住），请手动长按“按住”完成，通过后流程会继续`,
-    'warning'
-  );
-  // Do not try to auto long-press — Microsoft blocks synthetic hold events.
   void holdBtn;
+  if (lastAction === 'human-check-skip') return;
+  lastAction = 'human-check-skip';
+  sendLog(`${source}：检测到人机验证（证明你不是机器人 / 按住），跳过当前账号`, 'error');
+  chrome.runtime.sendMessage({
+    action: 'skipAccount',
+    reason: '触发人机验证: 证明你不是机器人'
+  }).catch(() => {});
 }
 
 // Step 3: proof-initial / proof-resend / code / consent / complete / passkey mid-flow
@@ -950,6 +1091,16 @@ function executeStep3() {
 
   if (page.kind === 'rate-limit') {
     handleRateLimitSkip('步骤 3/4', page.message);
+    return;
+  }
+  if (page.kind === 'try-later') {
+    handleTryLaterSkip('步骤 3/4', page.message);
+    return;
+  }
+
+  // Face / fingerprint prompt mid-flow → skip account.
+  if (page.kind === 'biometric') {
+    handleBiometricSkip('步骤 3/4', page.message);
     return;
   }
 
@@ -1166,6 +1317,18 @@ async function checkPageState() {
   // Rate-limit / 429 → skip account (auto + step-by-step).
   if (page.kind === 'rate-limit') {
     handleRateLimitSkip(execMode === 'auto' ? '自动' : '检测', page.message);
+    return;
+  }
+
+  // "请稍后重试 / 目前无法使你登录" → skip account (auto + step-by-step).
+  if (page.kind === 'try-later') {
+    handleTryLaterSkip(execMode === 'auto' ? '自动' : '检测', page.message);
+    return;
+  }
+
+  // Face / fingerprint (Windows Hello) prompt → skip account (auto + step-by-step).
+  if (page.kind === 'biometric') {
+    handleBiometricSkip(execMode === 'auto' ? '自动' : '检测', page.message);
     return;
   }
 
