@@ -18,7 +18,11 @@ document.addEventListener('DOMContentLoaded', () => {
     resultCount: $('resultCount'),
     resultSortSelect: $('resultSortSelect'),
     copyResultsBtn: $('copyResultsBtn'),
+    copySuccessBtn: $('copySuccessBtn'),
     exportResultsBtn: $('exportResultsBtn'),
+    retryFailedBtn: $('retryFailedBtn'),
+    clearResultsBtn: $('clearResultsBtn'),
+    parseHint: $('parseHint'),
     currentAccountText: $('currentAccountText'),
     progressText: $('progressText'),
     step1: $('step1'), step2: $('step2'), step3: $('step3'), step4: $('step4'),
@@ -108,6 +112,8 @@ document.addEventListener('DOMContentLoaded', () => {
       if (Array.isArray(status.results) && status.results.length && !resultRecords.length) {
         restoreResultsFromStorage(status.results);
       }
+      if (status.stats) renderStats(status.stats);
+      else refreshStats();
 
       if (status.running) {
         setUiState('running');
@@ -126,12 +132,83 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  // Account count
-  els.accountInput.addEventListener('input', updateCount);
+  // Account count + live precheck
+  let parseTimer = null;
+  els.accountInput.addEventListener('input', () => {
+    updateCount();
+    clearTimeout(parseTimer);
+    parseTimer = setTimeout(runAccountPrecheck, 280);
+  });
   function updateCount() {
     const lines = els.accountInput.value.split('\n').map(l => l.trim()).filter(l => l);
     els.accountCount.textContent = lines.length;
     chrome.storage.local.set({ savedAccounts: els.accountInput.value });
+  }
+
+  function localParseAccounts(text) {
+    const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const lines = String(text || '').split('\n');
+    const valid = [];
+    const invalid = [];
+    const seen = new Set();
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i].trim();
+      if (!raw) continue;
+      const p = raw.split(/----|:|\|/);
+      const email = (p[0] || '').trim();
+      const password = (p[1] || '').trim();
+      if (!email || !password) {
+        invalid.push({ line: i + 1, reason: '缺少邮箱或密码' });
+        continue;
+      }
+      if (!emailRe.test(email)) {
+        invalid.push({ line: i + 1, reason: '邮箱格式无效' });
+        continue;
+      }
+      const key = email.toLowerCase();
+      if (seen.has(key)) {
+        invalid.push({ line: i + 1, reason: '重复邮箱' });
+        continue;
+      }
+      seen.add(key);
+      valid.push(email);
+    }
+    return { valid, invalid, validCount: valid.length, invalidCount: invalid.length };
+  }
+
+  function runAccountPrecheck() {
+    if (!els.parseHint) return;
+    const text = els.accountInput.value;
+    if (!text.trim()) {
+      els.parseHint.hidden = true;
+      els.parseHint.textContent = '';
+      return;
+    }
+    const p = localParseAccounts(text);
+    els.parseHint.hidden = false;
+    if (!p.validCount && p.invalidCount) {
+      els.parseHint.className = 'parse-hint warn';
+      const sample = p.invalid.slice(0, 3).map((x) => `L${x.line} ${x.reason}`).join('；');
+      els.parseHint.textContent = `预检：0 有效，${p.invalidCount} 行无效（${sample}）`;
+    } else if (p.invalidCount) {
+      els.parseHint.className = 'parse-hint warn';
+      const sample = p.invalid.slice(0, 3).map((x) => `L${x.line} ${x.reason}`).join('；');
+      els.parseHint.textContent = `预检：${p.validCount} 有效，跳过 ${p.invalidCount} 行（${sample}${p.invalidCount > 3 ? '…' : ''}）`;
+    } else {
+      els.parseHint.className = 'parse-hint ok';
+      els.parseHint.textContent = `预检：${p.validCount} 个账号格式有效`;
+    }
+  }
+
+  function updateRetryButton() {
+    const failed = resultRecords.filter((r) => !r.success);
+    if (els.retryFailedBtn) {
+      els.retryFailedBtn.disabled = !(failed.length && uiState === 'idle');
+      els.retryFailedBtn.textContent = failed.length ? `重跑失败(${failed.length})` : '重跑失败';
+    }
+    if (els.clearResultsBtn) {
+      els.clearResultsBtn.disabled = resultRecords.length === 0 && !els.resultsOutput.value.trim();
+    }
   }
 
   // ============== Step circles ==============
@@ -193,7 +270,7 @@ document.addEventListener('DOMContentLoaded', () => {
     uiState = state;
     const running = state === 'running';
     const paused = state === 'paused';
-    els.startBtn.disabled = running;
+    els.startBtn.disabled = running || paused;
     if (els.pauseBtn) els.pauseBtn.disabled = !running;
     if (els.resumeBtn) els.resumeBtn.disabled = !paused;
     els.stopBtn.disabled = !(running || paused);
@@ -201,13 +278,23 @@ document.addEventListener('DOMContentLoaded', () => {
     // 下一个账号：自动/逐步骤/暂停均可点，强制切到队列下一号
     if (els.nextAccountBtn) els.nextAccountBtn.disabled = !(running || paused);
     els.accountInput.disabled = running;
+    updateRetryButton();
   }
 
   // ============== Actions ==============
   els.startBtn.addEventListener('click', () => {
-    const lines = els.accountInput.value.split('\n').map(l => l.trim()).filter(l => l);
-    if (!lines.length) return;
-    totalAccounts = lines.length;
+    const rawLines = els.accountInput.value.split('\n').map(l => l.trim()).filter(l => l);
+    if (!rawLines.length) return;
+    const pre = localParseAccounts(els.accountInput.value);
+    if (!pre.validCount) {
+      addLog('没有有效账号（需要 邮箱----密码，且邮箱格式正确）', 'error');
+      runAccountPrecheck();
+      return;
+    }
+    if (pre.invalidCount) {
+      addLog(`预检将跳过 ${pre.invalidCount} 行无效/重复账号`, 'warning');
+    }
+    totalAccounts = pre.validCount;
     setUiState('running');
     resetSteps();
     setStep(1, 'active');
@@ -217,8 +304,8 @@ document.addEventListener('DOMContentLoaded', () => {
     els.resultCount.textContent = '0';
     clearLog();
     const modeLabel = currentMode === 'auto' ? '自动' : '逐步骤';
-    addLog(`开始处理 ${lines.length} 个账号，模式: ${modeLabel}`, 'info');
-    chrome.runtime.sendMessage({ action: 'start', accounts: lines, mode: currentMode });
+    addLog(`开始处理 ${pre.validCount} 个有效账号，模式: ${modeLabel}`, 'info');
+    chrome.runtime.sendMessage({ action: 'start', accounts: rawLines, mode: currentMode });
   });
 
   els.pauseBtn?.addEventListener('click', () => {
@@ -281,6 +368,10 @@ document.addEventListener('DOMContentLoaded', () => {
       case 'accountResult':
         appendResult(msg.result);
         break;
+      case 'stats':
+        if (msg.stats) renderStats(msg.stats);
+        else refreshStats();
+        break;
       case 'started':
         setUiState('running');
         if (msg.total) els.progressText.textContent = `1/${msg.total}`;
@@ -340,6 +431,7 @@ document.addEventListener('DOMContentLoaded', () => {
     els.resultCount.textContent = String(sorted.length);
     if (totalAccounts) els.progressText.textContent = `${sorted.length}/${totalAccounts}`;
     els.resultsOutput.scrollTop = els.resultsOutput.scrollHeight;
+    updateRetryButton();
   }
 
   function normalizeStoredResult(r, seq) {
@@ -374,6 +466,7 @@ document.addEventListener('DOMContentLoaded', () => {
     renderResults();
     if (resultRecords.length) {
       addLog(`已恢复上次处理结果 ${resultRecords.length} 条（侧栏/窗口关闭后仍保留）`, 'info');
+      refreshStats();
     }
   }
 
@@ -396,6 +489,59 @@ document.addEventListener('DOMContentLoaded', () => {
 
     resultRecords.push(normalizeStoredResult(r, ++resultSeq));
     renderResults();
+    refreshStats();
+  }
+
+  function summarizeLocal() {
+    const list = resultRecords;
+    const success = list.filter((r) => r.success).length;
+    const failed = list.length - success;
+    const reasons = {};
+    for (const r of list) {
+      if (r.success) continue;
+      let key = String(r.error || '未知').replace(/\s+/g, ' ').trim().slice(0, 40);
+      if (/密码|password/i.test(key)) key = '密码/登录失败';
+      else if (/请求过多|rate|too many/i.test(key)) key = '限流';
+      else if (/人机|机器人/i.test(key)) key = '人机验证';
+      else if (/网络|SSL|硬错误|proxy/i.test(key)) key = '网络/代理';
+      else if (/用户|跳过|切换/i.test(key)) key = '用户跳过';
+      reasons[key] = (reasons[key] || 0) + 1;
+    }
+    const topReasons = Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 6)
+      .map(([reason, count]) => ({ reason, count }));
+    return {
+      total: list.length,
+      success,
+      failed,
+      successRate: list.length ? Math.round((success / list.length) * 1000) / 10 : 0,
+      topReasons,
+    };
+  }
+
+  function renderStats(stats) {
+    const card = document.getElementById('statsCard');
+    const summary = document.getElementById('statsSummary');
+    const reasonsEl = document.getElementById('statsReasons');
+    if (!card || !summary) return;
+    if (!stats || !stats.total) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    summary.textContent = `成功 ${stats.success} · 失败 ${stats.failed} · 合计 ${stats.total} · 成功率 ${stats.successRate}%`;
+    if (reasonsEl) {
+      reasonsEl.innerHTML = '';
+      for (const item of stats.topReasons || []) {
+        const chip = document.createElement('span');
+        chip.className = 'stats-chip';
+        chip.textContent = `${item.reason} ×${item.count}`;
+        reasonsEl.appendChild(chip);
+      }
+    }
+  }
+
+  function refreshStats() {
+    renderStats(summarizeLocal());
   }
 
   if (els.resultSortSelect) {
@@ -428,15 +574,29 @@ document.addEventListener('DOMContentLoaded', () => {
     return d.innerHTML;
   }
 
-  els.copyResultsBtn.addEventListener('click', async () => {
-    if (!els.resultsOutput.value.trim()) return;
+  async function copyText(text, okMsg) {
+    if (!String(text || '').trim()) return;
     try {
-      await navigator.clipboard.writeText(els.resultsOutput.value);
+      await navigator.clipboard.writeText(text);
     } catch (_) {
+      els.resultsOutput.value = text;
       els.resultsOutput.select();
       document.execCommand('copy');
     }
-    addLog('结果已复制', 'success');
+    addLog(okMsg || '已复制', 'success');
+  }
+
+  els.copyResultsBtn.addEventListener('click', () => {
+    copyText(els.resultsOutput.value, '结果已复制');
+  });
+
+  els.copySuccessBtn?.addEventListener('click', () => {
+    const lines = getSortedResultRecords().filter((r) => r.success).map(formatResultLine).join('\n');
+    if (!lines.trim()) {
+      addLog('没有成功结果可复制', 'warning');
+      return;
+    }
+    copyText(lines, `已复制 ${lines.split('\n').length} 条成功结果`);
   });
 
   els.exportResultsBtn.addEventListener('click', () => {
@@ -449,5 +609,69 @@ document.addEventListener('DOMContentLoaded', () => {
     a.download = `tokens_${Date.now()}.txt`;
     a.click();
     URL.revokeObjectURL(url);
+    addLog('结果已导出（建议导出后清空结果）', 'success');
   });
+
+  els.clearResultsBtn?.addEventListener('click', () => {
+    if (!resultRecords.length && !els.resultsOutput.value.trim()) return;
+    if (!confirm('确定清空全部处理结果？（本地持久化也会删除，不可恢复）')) return;
+    resultRecords = [];
+    resultSeq = 0;
+    els.resultsOutput.value = '';
+    els.resultCount.textContent = '0';
+    updateRetryButton();
+    refreshStats();
+    chrome.runtime.sendMessage({ action: 'clearResults' }, () => {
+      addLog('处理结果已清空', 'warning');
+    });
+  });
+
+  els.retryFailedBtn?.addEventListener('click', () => {
+    if (uiState !== 'idle') {
+      addLog('请先停止当前任务再重跑失败项', 'warning');
+      return;
+    }
+    const failed = resultRecords.filter((r) => !r.success && r.email && r.password);
+    if (!failed.length) {
+      addLog('没有带密码的失败记录可重跑（请从账号框重新粘贴）', 'warning');
+      return;
+    }
+    const lines = failed.map((r) => `${r.email}----${r.password}`);
+    // Prefill input for visibility
+    els.accountInput.value = lines.join('\n');
+    updateCount();
+    runAccountPrecheck();
+    totalAccounts = resultRecords.filter((r) => r.success).length + lines.length;
+    setUiState('running');
+    resetSteps();
+    setStep(1, 'active');
+    // Keep success rows; drop failure rows locally (SW will re-broadcast)
+    resultRecords = resultRecords.filter((r) => r.success);
+    resultSeq = resultRecords.length;
+    renderResults();
+    clearLog();
+    addLog(`重跑 ${lines.length} 个失败账号（已成功 ${resultRecords.length} 条保留）`, 'info');
+    chrome.runtime.sendMessage({
+      action: 'retryFailed',
+      accounts: lines,
+      mode: currentMode
+    }, (resp) => {
+      if (chrome.runtime.lastError) {
+        setUiState('idle');
+        addLog(`重跑失败: ${chrome.runtime.lastError.message}`, 'error');
+        return;
+      }
+      if (resp && resp.ok === false) {
+        setUiState('idle');
+        addLog(`重跑失败: ${resp.error || '未知错误'}`, 'error');
+      }
+    });
+  });
+
+  // Initial precheck if saved accounts exist
+  setTimeout(() => {
+    updateCount();
+    runAccountPrecheck();
+    updateRetryButton();
+  }, 0);
 });

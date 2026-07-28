@@ -11,7 +11,7 @@
 
 1. Fork 并创建分支：`feature/...` 或 `fix/...`
 2. 只修改与需求相关的文件，避免顺手大重构
-3. 本地执行 `npm run check`
+3. 本地执行 `npm run check` 与 `npm test`
 4. 在 Chrome 加载 `chrome-extension/`，走通登录 / 备用邮箱 / 换 token 主路径
 5. 打开 Pull Request，说明动机、行为变化与测试方式
 

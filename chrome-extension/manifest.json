@@ -1,8 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Outlook Token Fetcher",
-  "version": "1.27",
-  "description": "半自动获取 Outlook 账号 OAuth2 刷新令牌 — HTTP/SOCKS5 代理与测速；备用邮箱最多100；结果持久化；异常关闭自动暂停可继续；密码/限流/锁定/人机跳过；取码单飞；结果排序导出",
+  "version": "1.30",
+  "description": "半自动获取 Outlook 账号 OAuth2 刷新令牌 — 模块化；代理修复与紧急恢复；Client ID 池；统计面板；接码适配器；alarms 调度；单测",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": [
     "storage",
     "tabs",
@@ -14,19 +19,38 @@
     "webNavigation",
     "proxy",
     "webRequest",
-    "webRequestAuthProvider"
+    "webRequestAuthProvider",
+    "alarms"
   ],
   "host_permissions": [
     "*://login.microsoftonline.com/*",
     "*://login.live.com/*",
     "*://account.live.com/*",
+    "*://account.microsoft.com/*",
+    "*://signup.live.com/*",
     "*://*.microsoft.com/*",
     "*://*.live.com/*",
+    "*://*.office.com/*",
+    "*://*.office365.com/*",
+    "*://*.outlook.com/*",
+    "*://*.cloudflare.com/*",
+    "*://api.ipify.org/*",
+    "*://ipwho.is/*",
+    "*://ipapi.co/*",
+    "*://www.msftconnecttest.com/*"
+  ],
+  "optional_host_permissions": [
     "https://*/*",
-    "<all_urls>"
+    "http://*/*",
+    "*://*/*"
   ],
   "action": {
-    "default_title": "Outlook Token Fetcher"
+    "default_title": "Outlook Token Fetcher",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "side_panel": {
     "default_path": "popup/popup.html"
@@ -34,7 +58,8 @@
   "options_page": "options/options.html",
   "incognito": "split",
   "background": {
-    "service_worker": "background/background.js"
+    "service_worker": "background/background.js",
+    "type": "module"
   },
   "content_scripts": [
     {
@@ -42,6 +67,7 @@
         "*://login.microsoftonline.com/*",
         "*://login.live.com/*",
         "*://account.live.com/*",
+        "*://account.microsoft.com/*",
         "*://*.microsoft.com/*",
         "*://*.live.com/*"
       ],

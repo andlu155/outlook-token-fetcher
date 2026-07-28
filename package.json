@@ -1,11 +1,13 @@
 {
   "name": "outlook-token-fetcher",
-  "version": "1.27.0",
+  "version": "1.30.0",
   "description": "Chrome extension for semi-automatic Outlook / Microsoft OAuth2 refresh token fetching",
   "private": true,
+  "type": "module",
   "scripts": {
-    "check": "node --check chrome-extension/background/background.js && node --check chrome-extension/content/content.js && node --check chrome-extension/popup/popup.js && node --check chrome-extension/options/options.js",
-    "pack": "node scripts/pack.js"
+    "check": "node --check chrome-extension/background/background.js && node --check chrome-extension/content/content.js && node --check chrome-extension/popup/popup.js && node --check chrome-extension/options/options.js && node --check chrome-extension/shared/accounts.js && node --check chrome-extension/shared/oauth.js && node --check chrome-extension/shared/page-detect.js",
+    "test": "node tests/run-tests.mjs",
+    "pack": "node scripts/pack.cjs"
   },
   "keywords": [
     "chrome-extension",

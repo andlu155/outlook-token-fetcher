@@ -1,5 +1,41 @@
-// Chrome Extension Service Worker — Simplified 4-Step Flow
+// Chrome Extension Service Worker — Simplified 4-Step Flow (ES module)
 // Step 1: Open auth page | Step 2: Auto-fill email/password | Step 3: Backup email & code | Step 4: Exchange token
+
+import {
+  TOKEN_ENDPOINT,
+  MS_BROWSING_ORIGINS,
+  MS_COOKIE_DOMAIN_SUFFIXES,
+  PAGE_RECOVER_MAX,
+  PAGE_FULL_RERUN_MAX,
+  PAGE_RECOVER_COOLDOWN_MS,
+  PAGE_ANOMALY_SUSTAIN_MS,
+  PAGE_STUCK_MS,
+  PAGE_NAV_GRACE_MS,
+  ALARM,
+} from '../shared/constants.js';
+import {
+  parseAccountLines,
+  parseFixedBackupList,
+  resolveBackupEmail as resolveBackupEmailShared,
+  describeFixedBackupPick,
+} from '../shared/accounts.js';
+import {
+  generateCodeVerifier,
+  generateCodeChallenge,
+  getRandomState,
+  resolveClientId,
+  buildAuthUrl as buildAuthUrlShared,
+  exchangeToken as exchangeTokenShared,
+} from '../shared/oauth.js';
+import { humanDelay, sleep, resolvePace } from '../shared/delays.js';
+import { extractCodeFromMailObject, maskCode, sanitizeLogMessage } from '../shared/code-extract.js';
+import {
+  isHardNetworkErrorReason,
+  isLikelyPageErrorBlob,
+  summarizeResults,
+} from '../shared/page-detect.js';
+import { getAdapter, normalizeApiBase } from '../shared/temp-email-adapters.js';
+import { scheduleOnce, clearAllTaskAlarms, installAlarmListener } from './alarms.js';
 
 let accountsQueue = [];
 let currentAccount = null;
@@ -18,23 +54,14 @@ let backupEmailCursor = 0;
 let stateDirty = false;
 // Finished accounts since last Microsoft session cleanup (normal/incognito each have own SW).
 let accountsSinceCleanup = 0;
-const CLEANUP_EVERY_N = 5;
 // Last auth URL opened for current account (used to recover from SSL/blank error pages).
 let lastAuthUrl = null;
 // Rate-limit SSL/blank-page auto-recovery per account email.
 const pageRecoverAttempts = new Map(); // email -> { count, lastAt }
 // Full task re-runs after hard SSL / recover budget (transient proxy glitches).
 const pageFullRerunCount = new Map(); // email -> number of full re-runs already used
-const PAGE_RECOVER_MAX = 2; // soft blank only — limited blank hops, then full re-run
-const PAGE_FULL_RERUN_MAX = 1; // soft blank exhausted: re-run whole account once, then skip
-// Hard SSL/proxy errors rarely heal by reopening the same auth page — skip immediately.
-const PAGE_RECOVER_COOLDOWN_MS = 2500;
-// Blank/error must stay continuous this long before SW recovers (nav white-flash is shorter).
-const PAGE_ANOMALY_SUSTAIN_MS = 3000;
-// Soft blank only when automation has no progress this long (login transitions need more than 3s).
-const PAGE_STUCK_MS = 10000;
-// After a top-frame navigation starts, ignore soft-blank for this long (email→password hop).
-const PAGE_NAV_GRACE_MS = 6000;
+// Client IDs that failed token exchange this session (pool rotation).
+const failedClientIds = new Set();
 // Pending anomaly watches: tabId -> { firstSeenAt, reason, url, lastLogAt, hard, timer }
 const pageAnomalyWatch = new Map();
 // last progress timestamp (account actions / healthy page) — soft blank needs stuck + sustain
@@ -43,6 +70,10 @@ let lastProgressAt = Date.now();
 let lastNavAt = 0;
 // Suppress re-detect while a recovery navigation is in flight.
 let pageRecoverInFlightUntil = 0;
+
+function pace() {
+  return resolvePace(settings);
+}
 
 function markProgress() {
   lastProgressAt = Date.now();
@@ -56,65 +87,20 @@ function isInNavGrace() {
   return lastNavAt > 0 && Date.now() - lastNavAt < PAGE_NAV_GRACE_MS;
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-// Slightly slower inter-account / post-success pacing (anti risk-control).
-const ADVANCE_DELAY_MS = 2800;
-const ADVANCE_DELAY_JITTER_MS = 1200;
-const STEP4_AUTO_DELAY_MS = 900;
-const AUTH_UI_READY_MS = 2200;
-
-function humanDelay(baseMs, jitterMs = 400) {
-  return baseMs + Math.floor(Math.random() * Math.max(0, jitterMs));
+function getClientId() {
+  return resolveClientId(settings, { failedClientIds });
 }
 
-// Origins / cookie domains used by Microsoft login & Outlook (clear only these).
-const MS_BROWSING_ORIGINS = [
-  'https://login.microsoftonline.com',
-  'https://login.live.com',
-  'https://account.live.com',
-  'https://account.microsoft.com',
-  'https://signup.live.com',
-  'https://outlook.live.com',
-  'https://outlook.office.com',
-  'https://outlook.office365.com',
-  'https://www.office.com',
-  'https://www.microsoft.com',
-  'https://microsoft.com',
-  'https://www.live.com',
-  'https://live.com',
-];
-const MS_COOKIE_DOMAIN_SUFFIXES = [
-  'login.microsoftonline.com',
-  'microsoftonline.com',
-  'login.live.com',
-  'account.live.com',
-  'account.microsoft.com',
-  'live.com',
-  'microsoft.com',
-  'office.com',
-  'office365.com',
-  'outlook.live.com',
-  'outlook.office.com',
-  'msn.com',
-];
-
-function getScopes() {
-  // 默认 Graph；仅当显式选择 imap 时走 IMAP/SMTP
-  const mode = (settings.apiMode || 'graph').toLowerCase();
-  if (mode === 'imap') {
-    return 'offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send';
-  }
-  return 'offline_access https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send';
+function resolveBackupEmail(settingsObj = settings) {
+  const state = { cursor: backupEmailCursor };
+  const email = resolveBackupEmailShared(settingsObj, state);
+  backupEmailCursor = state.cursor;
+  return email;
 }
-const REDIRECT_URI = 'https://login.microsoftonline.com/common/oauth2/nativeclient';
-const AUTH_ENDPOINT = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize';
-const TOKEN_ENDPOINT = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
 
-const KNOWN_CLIENT_IDS = [
-  '9e5f94bc-e8a4-4e73-b8be-63364c29d753',
-];
+function buildAuthUrl(clientId, codeChallenge, state) {
+  return buildAuthUrlShared(clientId, codeChallenge, state, settings.apiMode);
+}
 
 // Strip Origin/Referer headers to bypass Microsoft cross-origin check for native client
 chrome.declarativeNetRequest.updateDynamicRules({
@@ -129,85 +115,7 @@ chrome.declarativeNetRequest.updateDynamicRules({
   }]
 });
 
-// ============== PKCE Helpers ==============
-function generateCodeVerifier() {
-  const array = new Uint8Array(32);
-  crypto.getRandomValues(array);
-  return base64URLEncode(array);
-}
-function base64URLEncode(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let bin = '';
-  bytes.forEach(b => bin += String.fromCharCode(b));
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-async function generateCodeChallenge(verifier) {
-  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
-  return base64URLEncode(new Uint8Array(hash));
-}
-function getRandomState() {
-  const array = new Uint8Array(16);
-  crypto.getRandomValues(array);
-  return Array.from(array, b => b.toString(16).padStart(2, '0')).join('');
-}
-function getClientId() {
-  if (settings.clientIdMode === 'custom' && settings.customClientId) return settings.customClientId;
-  return KNOWN_CLIENT_IDS[Math.floor(Math.random() * KNOWN_CLIENT_IDS.length)];
-}
-
-function randomBackupLocalPart(len = 8) {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let out = '';
-  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
-  return out;
-}
-
-function parseFixedBackupList(settingsObj = settings) {
-  const raw = settingsObj.backupEmailList;
-  let list = [];
-  if (Array.isArray(raw)) {
-    list = raw.map((s) => String(s || '').trim()).filter(Boolean);
-  } else if (typeof raw === 'string' && raw.trim()) {
-    list = raw.split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
-  }
-  // Legacy single field fallback.
-  if (!list.length && settingsObj.backupEmail) {
-    list = String(settingsObj.backupEmail).split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
-  }
-  return list.slice(0, 100);
-}
-
-// Resolve backup email from settings: multi fixed (round-robin), or random local-part @ domain.
-function resolveBackupEmail(settingsObj = settings) {
-  const mode = settingsObj.backupEmailMode === 'random' ? 'random' : 'fixed';
-  if (mode === 'random') {
-    const domain = (settingsObj.backupEmailDomain || '').trim().replace(/^@/, '');
-    if (!domain) return '';
-    return `${randomBackupLocalPart()}@${domain}`;
-  }
-  const list = parseFixedBackupList(settingsObj);
-  if (!list.length) return '';
-  const idx = ((backupEmailCursor % list.length) + list.length) % list.length;
-  const email = list[idx];
-  backupEmailCursor = (idx + 1) % list.length;
-  return email;
-}
-
-function describeFixedBackupPick(settingsObj, picked) {
-  const list = parseFixedBackupList(settingsObj);
-  if (!list.length || !picked) return '';
-  const pos = list.indexOf(picked);
-  if (pos < 0) return `固定备用邮箱: ${picked}`;
-  return `固定备用邮箱 (${pos + 1}/${list.length}): ${picked}`;
-}
-function buildAuthUrl(clientId, codeChallenge, state) {
-  const p = new URLSearchParams({
-    client_id: clientId, response_type: 'code', redirect_uri: REDIRECT_URI,
-    scope: getScopes(), code_challenge: codeChallenge, code_challenge_method: 'S256',
-    state: state, prompt: 'login'
-  });
-  return `${AUTH_ENDPOINT}?${p.toString()}`;
-}
+installAlarmListener();
 
 // ============== Side Panel ==============
 if (chrome.sidePanel?.setPanelBehavior) {
@@ -362,10 +270,28 @@ function applyProxyScopes(scopes, applyOne) {
 }
 
 function clearBrowserProxy() {
-  return applyProxyScopes(proxyScopesForWrite(), (scope, done) => {
-    chrome.proxy.settings.clear({ scope }, () => {
-      done(chrome.runtime.lastError?.message || null);
-    });
+  setProxyAuth(null);
+  const scopes = ['regular', 'incognito_persistent', 'incognito_session_only'];
+  return new Promise((resolve) => {
+    let left = scopes.length;
+    let regularOk = false;
+    const errors = {};
+
+    for (const scope of scopes) {
+      try {
+        chrome.proxy.settings.clear({ scope }, () => {
+          const err = chrome.runtime.lastError?.message;
+          if (err) errors[scope] = err;
+          else if (scope === 'regular') regularOk = true;
+          left -= 1;
+          if (left === 0) resolve({ ok: regularOk || Object.keys(errors).length < scopes.length, errors });
+        });
+      } catch (e) {
+        errors[scope] = e?.message || String(e);
+        left -= 1;
+        if (left === 0) resolve({ ok: regularOk || Object.keys(errors).length < scopes.length, errors });
+      }
+    }
   });
 }
 
@@ -405,6 +331,8 @@ async function applyProxyFromStorage(raw) {
     if (cleared.ok) console.log('[proxy] cleared (system default)');
     return cleared.ok ? { ok: true, enabled: false } : cleared;
   }
+  // Proxy auth listener is registered with <all_urls>; optional grant improves reliability.
+  // Actual permission request must be done from options UI (user gesture).
   setProxyAuth(cfg);
   const applied = await setBrowserProxy(cfg);
   if (applied.ok) {
@@ -730,7 +658,8 @@ function buildTaskStatus() {
     queueLen: accountsQueue.length,
     results,
     done: results.length,
-    total: results.length + accountsQueue.length + (currentAccount ? 1 : 0)
+    total: results.length + accountsQueue.length + (currentAccount ? 1 : 0),
+    stats: summarizeResults(results),
   };
 }
 
@@ -754,6 +683,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     switch (msg.action) {
       case 'applyProxySettings': {
         const result = await applyProxyFromStorage();
+        sendResponse(result);
+        return;
+      }
+      case 'resetProxy': {
+        await chrome.storage.local.set({ proxyEnabled: false });
+        setProxyAuth(null);
+        const result = await clearBrowserProxy();
         sendResponse(result);
         return;
       }
@@ -909,6 +845,54 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'log':
         sendLog(msg.message, msg.level);
         break;
+      case 'clearResults': {
+        results = [];
+        markDirty();
+        await chrome.storage.local.set({ sw_results: [] });
+        await saveState();
+        sendLog('已清空处理结果（含本地持久化）', 'warning');
+        sendResponse({ ok: true });
+        break;
+      }
+      case 'clearSensitiveData': {
+        const mode = msg.mode || 'results'; // results | secrets | all
+        const removed = await clearSensitiveStorage(mode);
+        sendResponse({ ok: true, removed, mode });
+        break;
+      }
+      case 'ensureHostPermission': {
+        // Prefer requesting from options page; SW check-only unless explicitly request:true.
+        const origin = normalizeHostOrigin(msg.origin || msg.url || '');
+        if (!origin) {
+          sendResponse({ ok: false, error: '无效地址' });
+          break;
+        }
+        const granted = await ensureOptionalHostPermission(origin, { request: !!msg.request });
+        sendResponse(granted);
+        break;
+      }
+      case 'parseAccounts': {
+        sendResponse(parseAccountLines(msg.accounts || []));
+        break;
+      }
+      case 'getStats': {
+        sendResponse(summarizeResults(results));
+        break;
+      }
+      case 'retryFailed': {
+        const lines = Array.isArray(msg.accounts) ? msg.accounts : [];
+        if (!lines.length) {
+          sendLog('没有可重跑的失败账号', 'warning');
+          sendResponse({ ok: false, error: 'empty' });
+          break;
+        }
+        currentMode = msg.mode || currentMode || 'auto';
+        settings = await chrome.storage.local.get(null);
+        await saveState();
+        await startProcess(lines, { preserveSuccessResults: true });
+        sendResponse({ ok: true, count: lines.length });
+        break;
+      }
     }
   }).catch(err => {
     console.error('Handler error:', err);
@@ -916,6 +900,95 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   });
   return true;
 });
+
+function normalizeHostOrigin(raw) {
+  let url = String(raw || '').trim().replace(/\/$/, '');
+  if (!url) return '';
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}/*`;
+  } catch (_) {
+    return '';
+  }
+}
+
+/**
+ * Check optional host permission. Request must happen from options/popup (user gesture);
+ * SW only verifies contains() — calling request() here often fails without a gesture.
+ */
+async function ensureOptionalHostPermission(originPattern, { request = false } = {}) {
+  if (!chrome.permissions?.contains) {
+    return { ok: true, granted: true, note: 'permissions API unavailable' };
+  }
+  try {
+    const has = await chrome.permissions.contains({ origins: [originPattern] });
+    if (has) return { ok: true, granted: true, already: true };
+    if (!request || !chrome.permissions.request) {
+      return { ok: false, granted: false, needGrant: true, origin: originPattern };
+    }
+    const granted = await chrome.permissions.request({ origins: [originPattern] });
+    return { ok: granted, granted, origin: originPattern };
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e), origin: originPattern };
+  }
+}
+
+/**
+ * Clear persisted sensitive data.
+ * mode: results | secrets | all
+ */
+async function clearSensitiveStorage(mode = 'results') {
+  const removed = [];
+  if (mode === 'results' || mode === 'all') {
+    results = [];
+    markDirty();
+    removed.push('sw_results');
+    await chrome.storage.local.set({ sw_results: [] });
+  }
+  if (mode === 'secrets' || mode === 'all') {
+    const secretKeys = [
+      'tempEmailAdminPassword',
+      'proxyEnabled',
+      'proxyType',
+      'proxyHost',
+      'proxyPort',
+      'proxyPassword',
+      'proxyUsername',
+      'customClientId',
+      'savedAccounts'
+    ];
+    await chrome.storage.local.remove(secretKeys);
+    await clearBrowserProxy();
+    removed.push(...secretKeys);
+    // Drop PKCE leftovers
+    try {
+      const all = await chrome.storage.local.get(null);
+      const pkceKeys = Object.keys(all || {}).filter((k) => k.startsWith('pkce_'));
+      if (pkceKeys.length) {
+        await chrome.storage.local.remove(pkceKeys);
+        removed.push(`pkce_x${pkceKeys.length}`);
+      }
+    } catch (_) {}
+  }
+  if (mode === 'all') {
+    accountsQueue = [];
+    currentAccount = null;
+    isRunning = false;
+    isPaused = false;
+    currentTabId = null;
+    clearAllTaskAlarms();
+    markDirty();
+    await chrome.storage.local.remove([
+      'sw_queue', 'sw_current', 'sw_tabId', 'sw_running', 'sw_paused'
+    ]);
+    removed.push('sw_queue', 'sw_current', 'sw_running');
+  }
+  await saveState();
+  const label = mode === 'all' ? '结果+密钥+队列' : mode === 'secrets' ? '敏感配置' : '处理结果';
+  sendLog(`已清空：${label}`, 'warning');
+  return removed;
+}
 
 // ============== Tab URL Listener (stash auth code; auto step 4 in auto mode) ==============
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -982,12 +1055,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
         if (currentMode === 'auto') {
           sendLog(`[${currentAccount.email}] ✅ 授权码已就绪，自动执行步骤 4 换取令牌`, 'success');
-          setTimeout(() => {
+          scheduleOnce(ALARM.STEP4, humanDelay(pace().step4AutoDelayMs, 400), () => {
             executeStep4().catch((e) => {
               if (/null|undefined/i.test(e?.message || '') && /email/i.test(e?.message || '')) return;
               sendLog(`自动换取令牌失败: ${e.message}`, 'error');
             });
-          }, humanDelay(STEP4_AUTO_DELAY_MS, 400));
+          });
         } else {
           sendLog(`[${currentAccount.email}] ✅ 授权码已就绪，请点击“步骤 4”获取令牌`, 'success');
         }
@@ -1025,11 +1098,7 @@ chrome.webNavigation.onErrorOccurred.addListener((details) => {
 });
 
 function isLikelyPageError(errorText, url, title) {
-  const blob = `${errorText || ''} ${url || ''} ${title || ''}`.toLowerCase();
-  if (/chrome-error:\/\/|chromewebdata/i.test(blob)) return true;
-  if (/err_ssl|err_connection|err_timed_out|err_name_not_resolved|err_network|err_tunnel|err_proxy|err_cert|err_empty_response|err_connection_reset|err_connection_closed|err_connection_refused|err_internet_disconnected|err_address_unreachable|err_ssl_protocol_error|err_ssl_version|err_bad_ssl|err_http2|dns_probe|net::err_/i.test(blob)) return true;
-  if (/无法提供安全连接|此网站无法提供安全连接|安全连接|响应无效|无法访问此网站|网页无法打开|连接已重置|连接超时|暂时无法访问|没有互联网连接|privacy error|your connection is not private|this site can.?t (be reached|provide a secure connection)|err_ssl_protocol_error/i.test(blob)) return true;
-  return false;
+  return isLikelyPageErrorBlob(errorText, url, title);
 }
 
 function isMsAuthRelatedUrl(url) {
@@ -1204,8 +1273,7 @@ async function maybeProbeErrorPage(tabId, url, title, statusComplete = false) {
 
 /** Hard SSL/network errors should re-run the whole account, not blank-hop. */
 function isHardNetworkError(reason) {
-  const s = String(reason || '');
-  return /ERR_SSL|ERR_CONNECTION|ERR_TIMED_OUT|ERR_NAME_NOT|ERR_NETWORK|ERR_TUNNEL|ERR_PROXY|ERR_CERT|ERR_EMPTY|ERR_INTERNET|ERR_ADDRESS|ERR_HTTP2|chrome-error|无法提供安全连接|安全连接|响应无效|title:.*安全|probe-inject-failed|content-error-page|webNavigation-error|too\s*many\s*requests|请求过多|rate\s*limit|throttl|http\s*429/i.test(s);
+  return isHardNetworkErrorReason(reason);
 }
 
 /**
@@ -1460,14 +1528,14 @@ async function executeStep1() {
   }
 
   const emailSnapshot = currentAccount?.email || '';
-  setTimeout(() => {
+  scheduleOnce(ALARM.AUTH_READY, humanDelay(pace().authUiReadyMs, 500), () => {
     broadcastStep(1, 'completed', emailSnapshot);
     if (currentMode === 'auto') {
       broadcastStep(2, 'active', emailSnapshot);
     } else {
       sendLog(`[${emailSnapshot}] 📝 授权页已打开，请点击“步骤 2”填写账号密码`, 'warning');
     }
-  }, humanDelay(AUTH_UI_READY_MS, 500));
+  });
 }
 
 // Step 4: exchange authorization code for refresh token
@@ -1606,11 +1674,17 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 // ============== Start Processing ==============
-async function startProcess(accounts) {
+async function startProcess(accounts, opts = {}) {
+  const preserveSuccessResults = !!opts.preserveSuccessResults;
   isRunning = true;
   isPaused = false;
   step4Lock = false;
-  results = [];
+  clearAllTaskAlarms();
+  if (preserveSuccessResults) {
+    results = (results || []).filter((r) => r.success && r.token);
+  } else {
+    results = [];
+  }
   currentAccount = null;
   claimedAuthCodes.clear();
   backupEmailCursor = 0;
@@ -1618,6 +1692,7 @@ async function startProcess(accounts) {
   lastAuthUrl = null;
   pageRecoverAttempts.clear();
   pageFullRerunCount.clear();
+  if (!preserveSuccessResults) failedClientIds.clear();
   for (const w of pageAnomalyWatch.values()) {
     if (w?.timer) clearTimeout(w.timer);
   }
@@ -1626,11 +1701,25 @@ async function startProcess(accounts) {
   markDirty();
   if (currentTabId) { chrome.tabs.remove(currentTabId).catch(() => {}); currentTabId = null; }
 
-  accountsQueue = accounts.map(a => {
-    const p = a.split(/----|:|\|/);
-    return { email: p[0]?.trim(), password: p[1]?.trim() };
-  }).filter(a => a.email && a.password);
+  const parsed = parseAccountLines(accounts);
+  if (parsed.invalidCount) {
+    const sample = parsed.invalid.slice(0, 5).map((x) => `L${x.line}:${x.reason}`).join('；');
+    sendLog(
+      `账号预检：跳过 ${parsed.invalidCount} 行无效/重复（${sample}${parsed.invalidCount > 5 ? '…' : ''}）`,
+      'warning'
+    );
+  }
+  accountsQueue = parsed.accounts.slice();
   markDirty();
+
+  if (!accountsQueue.length) {
+    isRunning = false;
+    isPaused = false;
+    await saveState();
+    sendLog('没有有效账号可处理（请检查 邮箱----密码 格式）', 'error');
+    broadcastToPopup({ type: 'stopped' });
+    return;
+  }
 
   // Clean old PKCE data
   chrome.storage.local.get(null, all => {
@@ -1639,8 +1728,15 @@ async function startProcess(accounts) {
   });
 
   await saveState();
-  sendLog(`开始处理 ${accountsQueue.length} 个账号`, 'info');
-  broadcastToPopup({ type: 'started', total: accountsQueue.length });
+  const tag = preserveSuccessResults ? '重跑失败账号' : '开始处理';
+  sendLog(`${tag} ${accountsQueue.length} 个账号`, 'info');
+  broadcastToPopup({ type: 'started', total: accountsQueue.length + (preserveSuccessResults ? results.length : 0) });
+  // Sync preserved results to UI
+  if (preserveSuccessResults && results.length) {
+    for (const r of results) {
+      broadcastToPopup({ type: 'accountResult', result: r });
+    }
+  }
   processNext();
 }
 
@@ -1653,6 +1749,7 @@ async function pauseProcess() {
   }
   isPaused = true;
   isRunning = false;
+  clearAllTaskAlarms();
   // Keep queue / currentAccount / tab / results so resume can continue.
   await saveState();
   sendLog('⏸ 任务已暂停（当前账号与队列已保留，可点“继续”）', 'warning');
@@ -1699,7 +1796,9 @@ async function resumeProcess(mode) {
     // If auth code already pending, finish step 4; otherwise reopen login.
     if (currentAccount.pendingAuthCode) {
       if (currentMode === 'auto') {
-        setTimeout(() => { executeStep4().catch(() => {}); }, humanDelay(STEP4_AUTO_DELAY_MS, 400));
+        scheduleOnce(ALARM.STEP4, humanDelay(pace().step4AutoDelayMs, 400), () => {
+          executeStep4().catch(() => {});
+        });
       } else {
         sendLog('授权码仍在，请点击“步骤 4”获取令牌', 'warning');
         broadcastStep(4, 'active', currentAccount.email);
@@ -1812,14 +1911,14 @@ async function processNext() {
     chrome.tabs.create(params, tab => { currentTabId = tab.id; saveState(); });
   }
 
-  setTimeout(() => {
+  scheduleOnce(ALARM.AUTH_READY, humanDelay(pace().authUiReadyMs + 500, 600), () => {
     broadcastStep(1, 'completed', account.email);
     if (currentMode === 'auto') {
       broadcastStep(2, 'active', account.email);
     } else {
       sendLog(`[${account.email}] 📝 逐步骤模式：点击"步骤 2"圆圈开始自动登录`, 'warning');
     }
-  }, humanDelay(AUTH_UI_READY_MS + 500, 600));
+  });
 }
 
 // ============== Microsoft / Outlook session cleanup ==============
@@ -1910,25 +2009,26 @@ async function clearOutlookSessionCache(reason = '') {
 }
 
 /** After finishing N accounts, clear MS session before opening the next auth page. */
-async function scheduleAdvance(delayMs = ADVANCE_DELAY_MS) {
+async function scheduleAdvance(delayMs) {
   if (isPaused || !isRunning) return;
-  const needClean = accountsSinceCleanup >= CLEANUP_EVERY_N;
+  const p = pace();
+  const base = delayMs != null ? delayMs : p.advanceDelayMs;
+  const needClean = accountsSinceCleanup >= p.cleanupEveryN;
   const wait = needClean
-    ? Math.max(delayMs, humanDelay(1200, 400))
-    : humanDelay(delayMs, ADVANCE_DELAY_JITTER_MS);
-  setTimeout(async () => {
+    ? Math.max(base, humanDelay(1200, 400))
+    : humanDelay(base, p.advanceJitterMs);
+  scheduleOnce(ALARM.ADVANCE, wait, async () => {
     if (isPaused || !isRunning) return;
     try {
-      if (accountsSinceCleanup >= CLEANUP_EVERY_N) {
+      if (accountsSinceCleanup >= pace().cleanupEveryN) {
         await clearOutlookSessionCache(`已处理 ${accountsSinceCleanup} 个账号`);
-        // Extra pause after cache clear so next login looks less bot-like.
-        await new Promise((r) => setTimeout(r, humanDelay(800, 600)));
+        await sleep(humanDelay(800, 600));
       }
     } catch (e) {
       sendLog(`缓存清理异常: ${e.message || e}`, 'warning');
     }
     if (!isPaused && isRunning) processNext();
-  }, wait);
+  });
 }
 
 // ============== Manual skip to next account ==============
@@ -2046,16 +2146,21 @@ async function finishAccount(result) {
     sendLog(`[${result.email}] ✅ 获取 Refresh Token 成功`, 'success');
     pageFullRerunCount.delete(result.email);
     pageRecoverAttempts.delete(result.email);
+    if (result.clientId) failedClientIds.delete(result.clientId);
   } else {
     sendLog(`[${result.email}] ❌ 失败: ${result.error}`, 'error');
+    // Rotate away from client IDs that fail token exchange
+    if (result.clientId && /AADSTS|invalid_client|unauthorized_client|invalid_grant|token/i.test(String(result.error || ''))) {
+      failedClientIds.add(result.clientId);
+    }
   }
 
   broadcastToPopup({ type: 'accountResult', result });
+  broadcastToPopup({ type: 'stats', stats: summarizeResults(results) });
 
   if (isPaused) return;
-  // Always advance after a terminal finish when still running.
   if (shouldAdvance || isRunning) {
-    scheduleAdvance(ADVANCE_DELAY_MS);
+    scheduleAdvance();
   }
 }
 
@@ -2066,6 +2171,7 @@ async function stopProcess() {
   step4Lock = false;
   accountsQueue = [];
   currentAccount = null;
+  clearAllTaskAlarms();
   try {
     await chrome.storage.local.set({
       sw_running: false, sw_paused: false,
@@ -2081,51 +2187,37 @@ async function stopProcess() {
 
 // ============== Token Exchange ==============
 async function exchangeToken(authCode, clientId, codeVerifier) {
-  const body = new URLSearchParams({
-    client_id: clientId, scope: getScopes(), code: authCode,
-    redirect_uri: REDIRECT_URI, grant_type: 'authorization_code', code_verifier: codeVerifier
-  });
-  const res = await fetch(TOKEN_ENDPOINT, {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString()
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    let msg = `HTTP ${res.status}`;
-    try { const j = JSON.parse(text); msg = j.error_description || j.error || msg; } catch(_) { msg = text ? `${msg} - ${text.substring(0,200)}` : msg; }
-    throw new Error(msg);
-  }
-  return await res.json();
+  return exchangeTokenShared(authCode, clientId, codeVerifier, settings.apiMode, TOKEN_ENDPOINT);
 }
 
 // ============== Temp Email Polling ==============
 async function loadTempEmailSettings() {
-  // Always re-read from storage so options page changes take effect immediately.
   const all = await chrome.storage.local.get([
-    'tempEmailEnabled', 'tempEmailApiUrl', 'tempEmailAdminPassword',
-    'backupEmail', 'backupEmailList', 'backupEmailMode', 'backupEmailDomain', 'sw_settings'
+    'tempEmailEnabled', 'tempEmailApiUrl', 'tempEmailAdminPassword', 'tempEmailAdapter',
+    'backupEmail', 'backupEmailList', 'backupEmailMode', 'backupEmailDomain', 'sw_settings',
+    'paceCodeWaitMs', 'paceCodePollIntervalMs', 'paceCodePollMax'
   ]);
   const fromSw = all.sw_settings || {};
   return {
     tempEmailEnabled: all.tempEmailEnabled ?? fromSw.tempEmailEnabled,
     tempEmailApiUrl: all.tempEmailApiUrl || fromSw.tempEmailApiUrl || '',
     tempEmailAdminPassword: all.tempEmailAdminPassword || fromSw.tempEmailAdminPassword || '',
+    tempEmailAdapter: all.tempEmailAdapter || fromSw.tempEmailAdapter || 'admin',
     backupEmail: all.backupEmail || fromSw.backupEmail || '',
     backupEmailList: all.backupEmailList || fromSw.backupEmailList || [],
     backupEmailMode: all.backupEmailMode || fromSw.backupEmailMode || 'fixed',
-    backupEmailDomain: all.backupEmailDomain || fromSw.backupEmailDomain || ''
+    backupEmailDomain: all.backupEmailDomain || fromSw.backupEmailDomain || '',
+    paceCodeWaitMs: all.paceCodeWaitMs ?? fromSw.paceCodeWaitMs,
+    paceCodePollIntervalMs: all.paceCodePollIntervalMs ?? fromSw.paceCodePollIntervalMs,
+    paceCodePollMax: all.paceCodePollMax ?? fromSw.paceCodePollMax,
   };
-}
-
-function normalizeApiBase(raw) {
-  let url = (raw || '').trim().replace(/\/$/, '');
-  if (!url) return '';
-  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-  return url.replace(/\/$/, '');
 }
 
 async function fetchCodeFromTempEmail() {
   const cfg = await loadTempEmailSettings();
   settings = { ...settings, ...cfg };
+  const p = resolvePace(settings);
+  const adapter = getAdapter(cfg.tempEmailAdapter);
 
   if (!cfg.tempEmailEnabled) {
     sendLog('⚠️ 未启用自动接码，请到设置页勾选“启用自动接码”', 'warning');
@@ -2141,33 +2233,40 @@ async function fetchCodeFromTempEmail() {
   const searchAddress = currentAccount?.backupEmail ||
     (cfg.backupEmailMode === 'random' ? '' : (cfg.backupEmail || ''));
 
-  // Validate URL early
   try {
-    // eslint-disable-next-line no-new
     new URL(apiUrl);
   } catch (_) {
     sendLog(`❌ 接码 API 地址无效: ${cfg.tempEmailApiUrl}`, 'error');
     return null;
   }
 
-  sendLog(`正在查询验证码 (API: ${apiUrl}，邮箱: ${searchAddress || '未指定'})...`, 'info');
-  // Wait for the new mail to arrive — immediate poll often grabs a previous code.
-  sendLog('等待 3 秒后再取码（避免取到上一次的旧验证码）...', 'info');
-  await new Promise(r => setTimeout(r, 3000));
+  const originPat = normalizeHostOrigin(apiUrl);
+  if (originPat) {
+    try {
+      const perm = await ensureOptionalHostPermission(originPat);
+      if (!perm.ok && !perm.granted) {
+        sendLog(`❌ 未授权访问接码 API 域名（${originPat}）。请在设置页点「测试连接」并允许权限`, 'error');
+        return null;
+      }
+    } catch (_) {}
+  }
 
-  for (let i = 0; i < 20; i++) {
+  sendLog(`正在查询验证码 (适配器: ${adapter.id}，API: ${apiUrl}，邮箱: ${searchAddress || '未指定'})...`, 'info');
+  sendLog(`等待 ${Math.round(p.codeWaitMs / 1000)} 秒后再取码（避免取到旧验证码）...`, 'info');
+  await sleep(p.codeWaitMs);
+
+  const maxPoll = p.codePollMax;
+  for (let i = 0; i < maxPoll; i++) {
     await loadState();
     if (!isRunning || isPaused) {
       sendLog('已暂停/停止，取消验证码轮询', 'warning');
       return null;
     }
     try {
-      let url = `${apiUrl}/admin/mails?limit=10&offset=0`;
-      if (searchAddress) url += `&address=${encodeURIComponent(searchAddress)}`;
-
+      const url = adapter.buildUrl(apiUrl, { address: searchAddress, limit: 10, offset: 0 });
       const res = await fetch(url, {
         method: 'GET',
-        headers: { 'x-admin-auth': adminPass, 'Content-Type': 'application/json' },
+        headers: adapter.headers(adminPass),
         cache: 'no-store'
       });
       if (!res.ok) {
@@ -2177,35 +2276,17 @@ async function fetchCodeFromTempEmail() {
           sendLog('⚠️ Admin 密码可能不正确，请到设置页检查', 'warning');
           return null;
         }
-        // For 5xx keep retrying
       } else {
         const data = await res.json();
-        const mails = data.results || data.mails || data || [];
+        const mails = adapter.parseMails(data);
         if (!Array.isArray(mails)) {
           sendLog(`⚠️ 接码接口返回格式异常: ${typeof data}`, 'warning');
-        } else if (!mails.length) {
-          // no mails yet
-        } else {
+        } else if (mails.length) {
           for (const mail of mails) {
-            let fullText = '';
-            for (const key of Object.keys(mail || {})) {
-              if (typeof mail[key] === 'string') fullText += mail[key] + '\n';
-            }
-
-            const patterns = [
-              /你的一次性代码为[：:]\s*(\d{6})/,
-              /安全代码[：:]\s*(\d{6})/,
-              /一次性代码[：:]\s*(\d{6})/,
-              /security code[：:]\s*(\d{6})/i,
-              /code[：:\s]+(\d{6})/i,
-              /(\d{6})(?:\s|$)(?!.*\d{6})/m,
-            ];
-            for (const p of patterns) {
-              const m = fullText.match(p);
-              if (m?.[1]) {
-                sendLog(`✅ 匹配到验证码: ${m[1]}`, 'success');
-                return m[1];
-              }
+            const code = adapter.extractCode(mail);
+            if (code) {
+              sendLog(`✅ 匹配到验证码: ${maskCode(code)}`, 'success');
+              return code;
             }
           }
         }
@@ -2215,15 +2296,15 @@ async function fetchCodeFromTempEmail() {
       if (/Failed to fetch|NetworkError|network/i.test(msg)) {
         sendLog(`❌ 查询异常: Failed to fetch（无法访问接码 API）`, 'error');
         if (i === 0) {
-          sendLog(`排查: 1) 设置页 API 地址是否正确 2) 用浏览器直接打开 ${apiUrl} 看能否访问 3) 设置页点“测试连接”`, 'warning');
+          sendLog(`排查: 1) 设置页 API 地址是否正确 2) 点「测试连接」并允许主机权限 3) 确认服务可访问`, 'warning');
         }
       } else {
         sendLog(`❌ 查询异常: ${msg}`, 'error');
       }
     }
-    if (i < 19) {
-      sendLog(`第 ${i + 1}/20 次: 未获取到，等待3秒...`, 'info');
-      await new Promise(r => setTimeout(r, 3000));
+    if (i < maxPoll - 1) {
+      sendLog(`第 ${i + 1}/${maxPoll} 次: 未获取到，等待${Math.round(p.codePollIntervalMs / 1000)}秒...`, 'info');
+      await sleep(p.codePollIntervalMs);
     }
   }
   sendLog('❌ 验证码获取超时', 'error');
@@ -2232,8 +2313,9 @@ async function fetchCodeFromTempEmail() {
 
 // ============== Broadcast Helpers ==============
 function sendLog(message, level = 'info') {
-  console.log(`[${level}] ${message}`);
-  broadcastToPopup({ type: 'log', message, level });
+  const safe = sanitizeLogMessage(message);
+  console.log(`[${level}] ${safe}`);
+  broadcastToPopup({ type: 'log', message: safe, level });
 }
 
 function broadcastToPopup(msg) {

@@ -19,7 +19,11 @@ Chrome 扩展：半自动获取 Microsoft / Outlook 账号的 OAuth2 **Refresh T
 | 网络代理 | 可选 HTTP / SOCKS5 系统代理；支持测速与出口 IP/地区；普通/无痕上下文分 scope 应用 |
 | 缓存清理 | 每处理 5 个账号自动清理 Outlook/Microsoft 登录相关缓存 |
 | 异常恢复 | SSL/代理等硬网络错误直接跳过当前账号；**密码错误 / 密码登录不可用 / 登录次数过多** 直接跳过并进入下一账号；**Too Many Requests / 请求过多** 限流页直接跳过；帐户锁定 / 人机验证 /「请稍后重试」跳过；软白屏有限恢复 + 整任务重跑 1 次；登录过渡页忽略误判白屏 |
-| 结果 | 侧栏展示并持久化（侧栏/窗口关闭后仍可恢复）；可按 **执行先后** 或 **状态分组** 排序；复制 / 手动导出（不自动下载本地文件） |
+| 结果 | 侧栏展示并持久化（侧栏/窗口关闭后仍可恢复）；可按 **执行先后** 或 **状态分组** 排序；复制 / 复制成功 / 手动导出；**清空结果**；**重跑失败**（保留已成功） |
+| 账号预检 | 粘贴时即时检查格式/重复；开始时跳过无效行并写日志 |
+| 数据清理 | 侧栏清空结果；设置页可清空敏感配置（接码/代理密码等）或全部清空 |
+| 权限 | 默认仅 Microsoft 相关域名 + 测速站；接码 API / 代理认证按需申请 optional 主机权限 |
+| 日志脱敏 | 验证码、长 token 类字符串在侧栏日志中脱敏 |
 
 ## 目录结构
 
@@ -27,10 +31,13 @@ Chrome 扩展：半自动获取 Microsoft / Outlook 账号的 OAuth2 **Refresh T
 .
 ├── chrome-extension/          # 扩展本体（加载此目录）
 │   ├── manifest.json          # MV3 清单（当前版本见文件）
-│   ├── background/            # Service Worker
+│   ├── background/            # Service Worker（ES module）
 │   ├── content/               # 登录页自动化
 │   ├── popup/                 # Side Panel UI
-│   └── options/               # 设置页
+│   ├── options/               # 设置页
+│   ├── shared/                # 可复用纯逻辑（OAuth/解析/检测/接码适配器）
+│   └── icons/
+├── tests/                     # Node 单测
 ├── scripts/                   # 打包等工具脚本
 ├── package.json
 ├── LICENSE
@@ -100,6 +107,9 @@ Header: x-admin-auth: {adminPassword}
 # 语法检查
 npm run check
 
+# 纯函数单测（账号解析 / 页面文案 / 取码 / 统计）
+npm test
+
 # 打包 chrome-extension 为 zip（生成 dist/）
 npm run pack
 ```
@@ -117,14 +127,17 @@ npm run pack
 | `webNavigation` | 辅助导航与异常页检测 |
 | `proxy` / `webRequest` / `webRequestAuthProvider` | 可选系统代理与代理认证 |
 | `declarativeNetRequest` | 辅助请求处理（如清单中已配置） |
-| 主机权限 | Microsoft 登录相关域名与 HTTPS（接码 API 等） |
+| 主机权限 | 默认 Microsoft / Office / 测速相关域名；接码 API 与宽域代理认证为 **optional**，首次使用时申请 |
 
 ## 版本
 
-以 [`chrome-extension/manifest.json`](chrome-extension/manifest.json) 中的 `version` 为准（当前 **1.27**）。
+以 [`chrome-extension/manifest.json`](chrome-extension/manifest.json) 中的 `version` 为准（当前 **1.30**）。
 
 ### 近期变更摘要
 
+- **1.30** — 代理逻辑重构：修补代理清除与敏感配置清理未恢复系统代理隐患；选项页添加紧急一键恢复系统网络按钮
+- **1.29** — 中期/长期：`shared/` 模块化 + ES module SW；`chrome.alarms` 关键调度；可配置节奏；Client ID 池与失败轮换；本批统计面板；接码适配器抽象；`npm test` 纯函数单测
+- **1.28** — 短期加固：收窄 host 权限 + 扩展图标；账号预检；失败一键重跑；结果/敏感配置一键清空；日志脱敏；接码 API optional 权限；去掉外链字体
 - **1.27** — HTTP/SOCKS5 代理（启用/测速/出口地区；无痕分 scope）；固定备用邮箱上限 10→100；处理结果持久化；窗口/登录页异常关闭后自动暂停，点「继续」恢复队列
 - **1.26** — 识别 Microsoft「Too Many Requests / 请求过多」限流页，标记失败并跳过当前账号（不再当白屏反复重开）
 - **1.25** — 验证码取码单飞：取码进行中忽略 MutationObserver 重入，避免「查询/等 3 秒/匹配到」日志成对重复

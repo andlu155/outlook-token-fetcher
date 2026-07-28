@@ -35,6 +35,56 @@ function humanDelay(baseMs, jitterMs = 300) {
   return baseMs + Math.floor(Math.random() * Math.max(0, jitterMs));
 }
 
+/** Auto mode may skip accounts; step-by-step leaves decisions to the user. */
+function isAutoMode() {
+  return execMode === 'auto';
+}
+
+let lastSkipAttempt = 0;
+const SKIP_RETRY_COOLDOWN = 15000; // 15s before re-send if SW missed first attempt
+
+/**
+ * Ask background to fail+advance current account.
+ * Only auto mode sends skipAccount. Manual/step-by-step only logs once.
+ * For human-check / account-locked: allows one retry after cooldown in case
+ * SW missed the first message (e.g. currentAccount was null at the time).
+ */
+function requestSkipAccount(source, reason, actionKey) {
+  const key = String(actionKey || 'account-skip');
+  const isBlocked = lastAction === key || lastAction === `manual-wait-${key}`;
+  if (isBlocked) {
+    // Human-check / account-locked: allow retry after cooldown
+    // (SW may have ignored first attempt if currentAccount wasn't set).
+    if ((key === 'human-check-skip' || key === 'account-locked-skip') &&
+        isAutoMode() && lastAction === key &&
+        Date.now() - lastSkipAttempt > SKIP_RETRY_COOLDOWN) {
+      lastAction = ''; // clear to allow re-send
+    } else {
+      return;
+    }
+  }
+
+  if (!isAutoMode()) {
+    lastAction = `manual-wait-${key}`;
+    sendLog(
+      `${source}：检测到「${reason}」。逐步骤模式不自动跳过账号，请自行处理或点「下一个账号」`,
+      'warning'
+    );
+    return;
+  }
+
+  lastAction = key;
+  lastSkipAttempt = Date.now();
+  sendLog(`${source}：检测到「${reason}」，跳过当前账号`, 'error');
+  chrome.runtime.sendMessage({
+    action: 'skipAccount',
+    reason
+  }).catch(() => {
+    // Allow re-detect if SW message failed (avoids permanent stuck on same page).
+    if (lastAction === key) lastAction = '';
+  });
+}
+
 function isTopFrame() {
   try {
     return window === window.top;
@@ -438,14 +488,26 @@ function isAccountLockedPage(body) {
 }
 
 function isHumanCheckPage(body) {
-  // Press-and-hold / "prove you're not a robot" challenge.
-  if (/证明你不是机器人|prove you.?re not a robot|are you a robot|human verification|人机验证/i.test(body)) return true;
-  if (/长按该按钮|press and hold (the )?button|hold (the )?button/i.test(body)) return true;
+  // Strong text signals for captcha / press-and-hold challenge.
+  const strongText = /证明你不是机器人|prove you.?re not a robot|are you a robot|human verification|完成人机验证/i.test(body);
+  if (strongText) return true;
+
+  const holdText = /长按该按钮|press and hold (the )?button|hold (the )?button|按住按钮|按住以验证/i.test(body);
+  if (holdText) return true;
+
+  if (/i.?m not a robot|not a robot|security\s*challenge|arkose|funcaptcha|hcaptcha|recaptcha/i.test(body)) return true;
+
   // Button-only signal when copy is sparse.
   const holdBtn = findAllVisible('button, a, div[role="button"], input[type="button"], span[role="button"]')
     .find((el) => /^(按住|Press and hold|Hold|长按)$/i.test(buttonText(el))
       || /按住|Press and hold|Hold to|长按/i.test(buttonText(el)));
-  return !!holdBtn && /机器人|robot|人机|验证|verify|hold|按住|长按/i.test(body);
+
+  // If the hold button is present + matching body text → human-check.
+  if (holdBtn && /机器人|robot|人机|验证|verify|hold|按住|长按/i.test(body)) return true;
+
+  // Hold button gone → user likely already completed the captcha.
+  // Allow page to transition to next state instead of staying classified as human-check.
+  return false;
 }
 
 function findHoldButton() {
@@ -489,16 +551,10 @@ function detectRateLimitPage(body = pageText()) {
   return null;
 }
 
-/** Skip current account after rate-limit / 429 page (uses existing SW skipAccount). */
+/** Skip current account after rate-limit / 429 page (auto mode only). */
 function handleRateLimitSkip(source, message) {
-  if (lastAction === 'rate-limit-skip') return;
-  lastAction = 'rate-limit-skip';
-  const reason = String(message || 'Too Many Requests').replace(/\s+/g, ' ').trim().slice(0, 160);
-  sendLog(`${source}：检测到请求过多/限流（${reason}），跳过当前账号`, 'error');
-  chrome.runtime.sendMessage({
-    action: 'skipAccount',
-    reason: `请求过多: ${reason}`
-  }).catch(() => {});
+  const detail = String(message || 'Too Many Requests').replace(/\s+/g, ' ').trim().slice(0, 160);
+  requestSkipAccount(source, `请求过多: ${detail}`, 'rate-limit-skip');
 }
 
 /** Passkey *setup* pages only (have Cancel). Not the face/fingerprint login prompt. */
@@ -557,16 +613,10 @@ function detectBiometricPage(body = pageText()) {
   return null;
 }
 
-/** Skip current account after face/fingerprint prompt (uses existing SW skipAccount). */
+/** Skip current account after face/fingerprint prompt (auto mode only). */
 function handleBiometricSkip(source, message) {
-  if (lastAction === 'biometric-skip') return;
-  lastAction = 'biometric-skip';
-  const reason = String(message || '人脸/指纹识别').replace(/\s+/g, ' ').trim().slice(0, 160);
-  sendLog(`${source}：检测到人脸/指纹识别（${reason}），设备无法提供，跳过当前账号`, 'error');
-  chrome.runtime.sendMessage({
-    action: 'skipAccount',
-    reason: `人脸/指纹识别无法提供: ${reason}`
-  }).catch(() => {});
+  const detail = String(message || '人脸/指纹识别').replace(/\s+/g, ' ').trim().slice(0, 160);
+  requestSkipAccount(source, `人脸/指纹识别无法提供: ${detail}`, 'biometric-skip');
 }
 
 /**
@@ -595,16 +645,10 @@ function detectTryLaterPage(body = pageText()) {
   return null;
 }
 
-/** Skip current account after "请稍后重试" login block (uses existing SW skipAccount). */
+/** Skip current account after "请稍后重试" login block (auto mode only). */
 function handleTryLaterSkip(source, message) {
-  if (lastAction === 'try-later-skip') return;
-  lastAction = 'try-later-skip';
-  const reason = String(message || '请稍后重试').replace(/\s+/g, ' ').trim().slice(0, 160);
-  sendLog(`${source}：检测到「请稍后重试」（${reason}），跳过当前账号`, 'error');
-  chrome.runtime.sendMessage({
-    action: 'skipAccount',
-    reason: `请稍后重试: ${reason}`
-  }).catch(() => {});
+  const detail = String(message || '请稍后重试').replace(/\s+/g, ' ').trim().slice(0, 160);
+  requestSkipAccount(source, `请稍后重试: ${detail}`, 'try-later-skip');
 }
 
 /** Meaningful login / proof / code UI — never treat as blank. */
@@ -954,16 +998,10 @@ function detectPasswordLoginFailure(body = pageText()) {
   return null;
 }
 
-/** Skip current account after password login hard-fail (uses existing SW skipAccount). */
+/** Skip current account after password login hard-fail (auto mode only). */
 function handlePasswordLoginFailure(source, message) {
-  if (lastAction === 'password-error-skip') return;
-  lastAction = 'password-error-skip';
-  const reason = String(message || '密码错误或登录次数过多').replace(/\s+/g, ' ').trim().slice(0, 160);
-  sendLog(`${source}：检测到密码登录失败（${reason}），跳过当前账号`, 'error');
-  chrome.runtime.sendMessage({
-    action: 'skipAccount',
-    reason: `密码登录失败: ${reason}`
-  }).catch(() => {});
+  const detail = String(message || '密码错误或登录次数过多').replace(/\s+/g, ' ').trim().slice(0, 160);
+  requestSkipAccount(source, `密码登录失败: ${detail}`, 'password-error-skip');
 }
 
 // Step 2: account tile / Outlook email / Outlook password / keep-signed-in / passkey
@@ -1047,16 +1085,10 @@ function executeStep2() {
   sendLog('步骤 2/4：等待 Outlook 邮箱或密码页面', 'warning');
 }
 
-// Account locked intermediate page (leads to human check) → skip account.
+// Account locked intermediate page (leads to human check) → skip in auto, warn in manual.
 function handleAccountLocked(source, nextBtn) {
   void nextBtn;
-  if (lastAction === 'account-locked-skip') return;
-  lastAction = 'account-locked-skip';
-  sendLog(`${source}：检测到「帐户已锁定 / 人机验证」，跳过当前账号`, 'error');
-  chrome.runtime.sendMessage({
-    action: 'skipAccount',
-    reason: '触发人机验证: 帐户已锁定'
-  }).catch(() => {});
+  requestSkipAccount(source, '触发人机验证: 帐户已锁定', 'account-locked-skip');
 }
 
 // Risk-control: "where should we send the code?" dropdown page → click 下一步.
@@ -1072,16 +1104,10 @@ function handleCodeSendMethod(source, nextBtn) {
   }
 }
 
-// Press-and-hold robot check → skip account (cannot provide device interaction).
+// Press-and-hold / captcha → skip in auto, warn in manual (cannot automate device interaction).
 function handleHumanCheck(source, holdBtn) {
   void holdBtn;
-  if (lastAction === 'human-check-skip') return;
-  lastAction = 'human-check-skip';
-  sendLog(`${source}：检测到人机验证（证明你不是机器人 / 按住），跳过当前账号`, 'error');
-  chrome.runtime.sendMessage({
-    action: 'skipAccount',
-    reason: '触发人机验证: 证明你不是机器人'
-  }).catch(() => {});
+  requestSkipAccount(source, '触发人机验证: 证明你不是机器人', 'human-check-skip');
 }
 
 // Step 3: proof-initial / proof-resend / code / consent / complete / passkey mid-flow
@@ -1098,7 +1124,7 @@ function executeStep3() {
     return;
   }
 
-  // Face / fingerprint prompt mid-flow → skip account.
+  // Face / fingerprint prompt mid-flow → skip in auto, warn in manual.
   if (page.kind === 'biometric') {
     handleBiometricSkip('步骤 3/4', page.message);
     return;
@@ -1174,7 +1200,7 @@ function executeStep3() {
       }, humanDelay(FILL_TO_SUBMIT_MS, FILL_TO_SUBMIT_JITTER_MS));
     };
 
-    // 检查页面上是否提示了掩码邮箱 (例如 "我们将向 05*****@ldymail.cc.cd 发送代码")
+    // 检查页面上是否提示了掩码邮箱 (例如 "我们将向 05*****@example.com 发送代码")
     const bodyText = pageText();
     // 兼容中英文文案，并容忍掩码邮箱前后的空白/换行
     const maskedMatch =
@@ -1193,8 +1219,11 @@ function executeStep3() {
           return;
         }
         if (!matchedEmail) {
-          sendLog(`❌ 本地备用邮箱池中未找到与 ${maskedEmail} 匹配的邮箱，跳过该账号`, 'error');
-          chrome.runtime.sendMessage({ action: 'skipAccount', reason: `找不到匹配的备用邮箱 ${maskedEmail}` });
+          requestSkipAccount(
+            '步骤 3/4',
+            `找不到匹配的备用邮箱 ${maskedEmail}`,
+            'backup-mismatch-skip'
+          );
           return;
         }
         sendLog(`✅ 成功匹配到已有备用邮箱 ${matchedEmail}`, 'success');
@@ -1308,25 +1337,25 @@ async function checkPageState() {
     return;
   }
 
-  // Password hard-fail → skip account (auto + step-by-step).
+  // Password hard-fail → skip account (auto only; manual logs warning).
   if (page.kind === 'password-error') {
     handlePasswordLoginFailure(execMode === 'auto' ? '自动' : '检测', page.message);
     return;
   }
 
-  // Rate-limit / 429 → skip account (auto + step-by-step).
+  // Rate-limit / 429 → skip account (auto only; manual logs warning).
   if (page.kind === 'rate-limit') {
     handleRateLimitSkip(execMode === 'auto' ? '自动' : '检测', page.message);
     return;
   }
 
-  // "请稍后重试 / 目前无法使你登录" → skip account (auto + step-by-step).
+  // "请稍后重试 / 目前无法使你登录" → skip account (auto only; manual logs warning).
   if (page.kind === 'try-later') {
     handleTryLaterSkip(execMode === 'auto' ? '自动' : '检测', page.message);
     return;
   }
 
-  // Face / fingerprint (Windows Hello) prompt → skip account (auto + step-by-step).
+  // Face / fingerprint (Windows Hello) prompt → skip account (auto only; manual logs warning).
   if (page.kind === 'biometric') {
     handleBiometricSkip(execMode === 'auto' ? '自动' : '检测', page.message);
     return;
@@ -1346,13 +1375,13 @@ async function checkPageState() {
     return;
   }
 
-  // Account locked → click Next to reach human-check (both modes).
+  // Account locked → skip in auto, warn in manual (requestSkipAccount handles mode).
   if (page.kind === 'account-locked') {
     handleAccountLocked(execMode === 'auto' ? '自动' : '检测', page.nextBtn);
     return;
   }
 
-  // Human-check: only prompt (cannot auto long-press).
+  // Human-check captcha → skip in auto, warn in manual (user completed or cannot automate).
   if (page.kind === 'human-check') {
     handleHumanCheck(execMode === 'auto' ? '自动' : '检测', page.holdBtn);
     return;

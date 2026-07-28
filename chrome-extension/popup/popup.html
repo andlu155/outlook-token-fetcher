@@ -4,9 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Outlook Token Fetcher</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -40,6 +37,7 @@
         <span class="count-badge" id="accountCount">0</span>
       </label>
       <textarea id="accountInput" class="textarea" placeholder="user1@outlook.com----password123&#10;user2@outlook.com----password456" rows="4" spellcheck="false"></textarea>
+      <div class="parse-hint" id="parseHint" hidden></div>
     </div>
 
     <!-- Mode Selector -->
@@ -133,6 +131,16 @@
       </div>
     </div>
 
+    <!-- Stats -->
+    <div class="card stats-card" id="statsCard" hidden>
+      <div class="section-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+        <span>本批统计</span>
+      </div>
+      <div class="stats-row" id="statsSummary">—</div>
+      <div class="stats-reasons" id="statsReasons"></div>
+    </div>
+
     <!-- Results -->
     <div class="card">
       <div class="section-header">
@@ -147,11 +155,15 @@
               <option value="status">状态分组</option>
             </select>
           </label>
+          <button id="copySuccessBtn" class="small-btn" title="仅复制成功行">复制成功</button>
           <button id="copyResultsBtn" class="small-btn">复制</button>
           <button id="exportResultsBtn" class="small-btn">导出</button>
+          <button id="retryFailedBtn" class="small-btn small-btn-accent" title="仅重跑失败账号（保留已成功结果）" disabled>重跑失败</button>
+          <button id="clearResultsBtn" class="small-btn small-btn-danger" title="清空侧栏结果与本地持久化">清空结果</button>
         </div>
       </div>
       <textarea id="resultsOutput" class="textarea result-area" readonly placeholder="已获取的 token 将在此显示..." rows="3"></textarea>
+      <div class="result-footer-hint">结果含 refresh_token，用完请导出后点「清空结果」。敏感配置可在设置页清理。</div>
     </div>
   </div>
   <script src="popup.js"></script>

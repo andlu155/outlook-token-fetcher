@@ -42,3 +42,5 @@ secrets/
 tmp/
 temp/
 .cache/
+.omo/
+.codegraph/
